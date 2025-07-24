@@ -1,0 +1,5 @@
+# --- NeuroCam/Cargo.toml
+
+[workspace]
+members = ["packages/protocol", "packages/linux_receiver"]
+resolver = "2"
