@@ -1,0 +1,13 @@
+# --- packages/android_sender/Cargo.toml ---
+
+[package]
+name = "android_sender"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# 我们唯一需要的依赖就是 jni
+jni = "0.21.1"
