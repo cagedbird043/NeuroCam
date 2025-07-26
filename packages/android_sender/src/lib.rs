@@ -43,36 +43,49 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
     env: JNIEnv,
     _class: JClass,
     frame_buffer: JByteBuffer,
+    // AI-MOD-START
+    // 新增的参数，表示有效数据的大小
+    size: jni::sys::jint,
+    // AI-MOD-END
 ) {
-    // 检查 socket 是否已经被初始化
     if let Some(socket_mutex) = UDP_SOCKET.get() {
         let Ok(data_ptr) = env.get_direct_buffer_address(&frame_buffer) else {
-            logger::error("Failed to get direct buffer address.");
-            return;
-        };
-        let Ok(len) = env.get_direct_buffer_capacity(&frame_buffer) else {
-            logger::error("Failed to get direct buffer capacity.");
+            logger::error("[Rust] Failed to get direct buffer address.");
             return;
         };
 
+        // AI-MOD-START
+        // 核心修复：不再使用 get_direct_buffer_capacity()，而是使用从 Kotlin 传来的精确 size。
+        // 我们需要将 jint 转换为 Rust 的 usize 类型。
+        let len = size as usize;
+
+        logger::info(&format!(
+            "[Rust] Preparing to send a frame. Actual Size: {} bytes. Target: {}",
+            len, TARGET_ADDR
+        ));
+
+        // 使用精确的 len 来创建切片
         let data_slice = unsafe { std::slice::from_raw_parts(data_ptr, len) };
+        // AI-MOD-END
+
         let socket = socket_mutex.lock().unwrap();
 
         match socket.send_to(data_slice, TARGET_ADDR) {
             Ok(bytes_sent) => {
                 if bytes_sent != len {
                     logger::warn(&format!(
-                        "UDP send warning: tried to send {} bytes, but only sent {}.",
+                        "[Rust] UDP send warning: tried to send {} bytes, but OS only sent {}.",
                         len, bytes_sent
                     ));
                 }
+                // 为了避免日志刷屏，成功发送的消息就不打印了
             }
             Err(e) => {
-                logger::error(&format!("Failed to send UDP packet: {}", e));
+                logger::error(&format!("[Rust] Failed to send UDP packet. Error: {}", e));
             }
         }
     } else {
-        logger::error("UDP socket is not initialized. Call init() first.");
+        logger::error("[Rust] UDP socket is not initialized. Cannot send frame.");
     }
 }
 

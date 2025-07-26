@@ -71,48 +71,22 @@ class VideoEncoder(
         val codec = mediaCodec ?: return
 
         try {
-            // 1. 使用我们的扩展函数将 ImageProxy 转换为 NV21 格式的字节数组。
             val nv21Data = imageProxy.toNv21ByteArray()
 
-            // --- 输入阶段 ---
             val inputBufferIndex = codec.dequeueInputBuffer(10000)
             if (inputBufferIndex >= 0) {
                 val inputBuffer = codec.getInputBuffer(inputBufferIndex)!!
-
-                // AI-MOD-START
-                // --- 诊断步骤 ---
-                // 打印出缓冲区和我们数据的大小，以找出不匹配的原因。
-                // 这是解决问题的关键。
-                val inputCapacity = inputBuffer.capacity()
-                val dataSize = nv21Data.size
-
-                if (inputCapacity < dataSize) {
-                    Log.e(TAG, "CRITICAL ERROR: BufferOverflow about to happen. " +
-                            "InputBuffer Capacity: $inputCapacity, " +
-                            "Data Size: $dataSize")
-                    // 如果容量不足，我们就不执行 put 操作，直接返回，避免崩溃。
-                    // 这样我们可以安全地看到日志。
-                    return
-                }
-
-                Log.d(TAG, "Buffer Info: inputBuffer capacity=${inputCapacity}, nv21Data size=${dataSize}")
-                // --- 诊断结束 ---
-                // AI-MOD-END
-
                 inputBuffer.clear()
-                // 2. 将准备好的字节数组放入编码器的输入缓冲区。
                 inputBuffer.put(nv21Data)
-
                 codec.queueInputBuffer(
                     inputBufferIndex,
                     0,
-                    nv21Data.size, // 使用字节数组的实际大小
+                    nv21Data.size,
                     imageProxy.imageInfo.timestamp,
                     0
                 )
             }
 
-            // --- 输出阶段 ---
             val bufferInfo = MediaCodec.BufferInfo()
             while (true) {
                 val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
@@ -121,9 +95,11 @@ class VideoEncoder(
                         val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                         if (outputBuffer != null && bufferInfo.size > 0) {
                             Log.d(TAG, "Encoded frame ready. Size: ${bufferInfo.size}. Calling NativeBridge.")
-                            outputBuffer.position(bufferInfo.offset)
-                            outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                            NativeBridge.sendVideoFrame(outputBuffer)
+
+                            // AI-MOD-START
+                            // 核心修复：调用新的 JNI 函数，将 bufferInfo.size 作为第二个参数传递
+                            NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size)
+                            // AI-MOD-END
                         }
                         codec.releaseOutputBuffer(outputBufferIndex, false)
                     }
@@ -133,7 +109,7 @@ class VideoEncoder(
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Encoding error (Diagnostic Step)", e)
+            Log.e(TAG, "Encoding error (Final Fix)", e)
         }
     }
 }
