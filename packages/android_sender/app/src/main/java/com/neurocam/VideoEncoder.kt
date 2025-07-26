@@ -94,11 +94,16 @@ class VideoEncoder(
                     outputBufferIndex >= 0 -> {
                         val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                         if (outputBuffer != null && bufferInfo.size > 0) {
-                            Log.d(TAG, "Encoded frame ready. Size: ${bufferInfo.size}. Calling NativeBridge.")
-
                             // AI-MOD-START
-                            // 核心修复：调用新的 JNI 函数，将 bufferInfo.size 作为第二个参数传递
-                            NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size)
+                            // 核心修改：检查 bufferInfo 的 flags 字段，判断是否为关键帧 (I-frame)
+                            // MediaCodec.BUFFER_FLAG_KEY_FRAME 是一个标志位
+                            val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                            if (isKeyFrame) {
+                                Log.i(TAG, "Key Frame (I-frame) encoded. Size: ${bufferInfo.size}")
+                            }
+
+                            // 调用新的 JNI 函数，将 isKeyFrame 作为第三个参数传递
+                            NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame)
                             // AI-MOD-END
                         }
                         codec.releaseOutputBuffer(outputBufferIndex, false)

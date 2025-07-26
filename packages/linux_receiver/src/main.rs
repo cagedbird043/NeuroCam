@@ -10,9 +10,7 @@ use tokio::net::UdpSocket;
 
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
 const MAX_DATAGRAM_SIZE: usize = 65_507;
-// 输出文件现在是原始H.264码流，用.h264后缀更准确
 const OUTPUT_FILENAME: &str = "output.h264";
-// 如果一个帧在5秒内没有收到任何新分片，就认为它已经丢失并丢弃
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 用于重组单个视频帧的结构体
@@ -21,15 +19,17 @@ struct FrameReassembler {
     received_count: u16,
     total_packets: u16,
     last_seen: Instant,
+    is_key_frame: bool, // 新增：存储关键帧标记
 }
 
 impl FrameReassembler {
-    fn new(total_packets: u16) -> Self {
+    fn new(total_packets: u16, is_key_frame: bool) -> Self {
         FrameReassembler {
             packets: vec![None; total_packets as usize],
             received_count: 0,
             total_packets,
             last_seen: Instant::now(),
+            is_key_frame,
         }
     }
 
@@ -58,7 +58,7 @@ impl FrameReassembler {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    println!("[NeuroCam Linux Receiver - v5.1 with Reassembly]");
+    println!("[NeuroCam Linux Receiver - v6.0 with I-Frame Detection]");
     println!("Starting UDP listener on {}...", LISTEN_ADDR);
     println!(
         "Reassembled H.264 stream will be saved to '{}'",
@@ -70,7 +70,6 @@ async fn main() -> io::Result<()> {
     let mut writer = BufWriter::new(output_file);
     let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
 
-    // 使用 HashMap 存储正在重组的帧
     let mut reassemblers: HashMap<u32, FrameReassembler> = HashMap::new();
 
     loop {
@@ -82,22 +81,25 @@ async fn main() -> io::Result<()> {
                 };
 
                 let payload = buf[HEADER_SIZE..len].to_vec();
+                let is_key_frame = header.is_key_frame != 0;
 
                 let reassembler = reassemblers
                     .entry(header.frame_id)
-                    .or_insert_with(|| FrameReassembler::new(header.total_packets));
+                    .or_insert_with(|| FrameReassembler::new(header.total_packets, is_key_frame));
 
                 if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
-                    println!(
-                        "Frame #{} reassembled successfully ({} bytes). Writing to file.",
-                        header.frame_id,
-                        complete_frame.len()
-                    );
+                    // 核心诊断逻辑
+                    if reassembler.is_key_frame {
+                        println!("[KEY FRAME] Frame #{} reassembled successfully ({} bytes). Writing to file.", header.frame_id, complete_frame.len());
+                    } else {
+                        // 为了保持控制台清爽，可以注释掉非关键帧的日志
+                        // println!("Frame #{} reassembled ({} bytes).", header.frame_id, complete_frame.len());
+                    }
+
                     if let Err(e) = writer.write_all(&complete_frame) {
                         eprintln!("Error writing to file: {}", e);
-                        break; // 写入失败是严重错误，退出循环
+                        break;
                     }
-                    // 帧处理完毕，从缓存中移除
                     reassemblers.remove(&header.frame_id);
                 }
             }
@@ -107,12 +109,16 @@ async fn main() -> io::Result<()> {
             }
         }
 
-        // 清理超时的帧
         reassemblers.retain(|frame_id, reassembler| {
             if reassembler.last_seen.elapsed() > FRAME_TIMEOUT {
+                let frame_type = if reassembler.is_key_frame {
+                    "KEY FRAME"
+                } else {
+                    "Frame"
+                };
                 println!(
-                    "Frame #{} timed out. Discarding {} of {} received packets.",
-                    frame_id, reassembler.received_count, reassembler.total_packets
+                    "[TIMEOUT] {} #{} timed out. Discarding {} of {} received packets.",
+                    frame_type, frame_id, reassembler.received_count, reassembler.total_packets
                 );
                 false
             } else {

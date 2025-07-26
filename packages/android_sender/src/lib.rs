@@ -30,12 +30,16 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_init(_env: JNIEnv, _class:
     logger::info("Rust NativeBridge_init call completed.");
 }
 
+// --- packages/android_sender/src/lib.rs ---
+
+// AI-MOD-START
 #[no_mangle]
 pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
     env: JNIEnv,
     _class: JClass,
     frame_buffer: JByteBuffer,
     size: jni::sys::jint,
+    is_key_frame: jni::sys::jboolean, // 新增参数
 ) {
     let Some(socket_mutex) = UDP_SOCKET.get() else {
         logger::error("[Rust] UDP socket is not initialized. Cannot send frame.");
@@ -54,6 +58,13 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
     let chunks: Vec<&[u8]> = data_slice.chunks(MAX_PAYLOAD_SIZE).collect();
     let total_packets = chunks.len() as u16;
 
+    if is_key_frame != 0 {
+        logger::info(&format!(
+            "[Rust] Sending Key Frame #{} in {} packets.",
+            frame_id, total_packets
+        ));
+    }
+
     let socket = socket_mutex.lock().unwrap();
     let mut packet_buffer = [0u8; HEADER_SIZE + MAX_PAYLOAD_SIZE];
 
@@ -63,6 +74,7 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
             frame_id,
             packet_id,
             total_packets,
+            is_key_frame: is_key_frame as u8, // 将 jboolean (u8) 直接转换为 u8
         };
 
         // 填充包头
@@ -79,6 +91,7 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
         }
     }
 }
+// AI-MOD-END
 
 #[no_mangle]
 pub extern "system" fn Java_com_neurocam_NativeBridge_close(_env: JNIEnv, _class: JClass) {
