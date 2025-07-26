@@ -199,14 +199,25 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
 
 #[no_mangle]
 pub extern "system" fn Java_com_neurocam_NativeBridge_close(_env: JNIEnv, _class: JClass) {
+    // AI-MOD-START
     logger::info("NativeBridge_close called. Signaling threads to shut down...");
     SHUTDOWN_FLAG.store(true, Ordering::Relaxed);
+
+    // --- 优雅停机逻辑 ---
+    // 给后台线程一点时间来完成最后的ACK处理或重传。
+    // 这个时间应该略长于一个重传周期，以确保能覆盖最后一次检查。
+    logger::info("Waiting for a graceful shutdown...");
+    thread::sleep(RETRANSMISSION_TIMEOUT + Duration::from_millis(100)); // e.g., 500ms + 100ms
+                                                                        // --- 优雅停机逻辑结束 ---
 
     // 等待后台线程结束
     let mut handles = THREAD_HANDLES.lock().unwrap();
     while let Some(handle) = handles.pop() {
-        let _ = handle.join();
+        if let Err(e) = handle.join() {
+            logger::error(&format!("Failed to join thread: {:?}", e));
+        }
     }
-    logger::info("All background threads have been shut down.");
+    logger::info("All background threads have been shut down cleanly.");
+    // AI-MOD-END
 }
 // AI-MOD-END
