@@ -189,6 +189,9 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
     frame_buffer: JByteBuffer,
     size: jni::sys::jint,
     is_key_frame: jboolean,
+    // AI-MOD-START
+    capture_timestamp_ns: jni::sys::jlong, // 新增时间戳参数
+                                           // AI-MOD-END
 ) {
     let Ok(data_ptr) = _env.get_direct_buffer_address(&frame_buffer) else {
         logger::error("[Rust] Failed to get direct buffer address.");
@@ -206,12 +209,15 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
     };
 
     for (i, chunk) in chunks.iter().enumerate() {
+        // AI-MOD-START
         let header = DataHeader {
             frame_id,
+            capture_timestamp_ns: capture_timestamp_ns as u64,
             packet_id: i as u16,
             total_packets,
             is_key_frame: is_key_frame as u8,
         };
+        // AI-MOD-END
 
         let mut packet_data = Vec::with_capacity(1 + DATA_HEADER_SIZE + chunk.len());
         packet_data.push(PacketType::Data as u8);
@@ -230,7 +236,6 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
 
     if is_key_frame != 0 {
         if let Ok(mut unacked_frames) = UNACKED_IFRAMES.lock() {
-            // logger::info(&format!("[CACHE] Caching I-Frame #{} for ACK.", frame_id));
             unacked_frames.insert(frame_id, (packets_to_cache, Instant::now(), 0));
         }
     }

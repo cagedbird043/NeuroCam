@@ -34,8 +34,9 @@ object NativeBridge {
      * @param frameBuffer 一个包含 H.264 编码数据的 Direct ByteBuffer。
      * @param size 缓冲区中有效数据的实际大小。
      * @param isKeyFrame 标记此帧是否为关键帧 (I-frame)。
+     * @param timestampNs 帧的捕获时间戳（纳秒）。
      */
-    external fun sendVideoFrame(frameBuffer: ByteBuffer, size: Int, isKeyFrame: Boolean)
+    external fun sendVideoFrame(frameBuffer: java.nio.ByteBuffer, size: Int, isKeyFrame: Boolean, timestampNs: Long)
     // AI-MOD-END
     external fun close()
 }

@@ -96,11 +96,12 @@ class VideoEncoder(
                 val inputBuffer = codec.getInputBuffer(inputBufferIndex)!!
                 inputBuffer.clear()
                 inputBuffer.put(nv21Data)
+                // 这里的 presentationTimeUs 仍然使用 ImageProxy 的时间戳，以保证帧的顺序
                 codec.queueInputBuffer(
                     inputBufferIndex,
                     0,
                     nv21Data.size,
-                    imageProxy.imageInfo.timestamp,
+                    imageProxy.imageInfo.timestamp / 1000, // 将纳秒转换为微秒给 MediaCodec
                     0
                 )
             }
@@ -113,10 +114,14 @@ class VideoEncoder(
                         val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                         if (outputBuffer != null && bufferInfo.size > 0) {
                             val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                            if (isKeyFrame) {
-                                Log.i(TAG, "Key Frame (I-frame) encoded. Size: ${bufferInfo.size}")
-                            }
-                            NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame)
+
+                            // AI-MOD-START
+                            // 核心修复：不再使用 bufferInfo 的时间戳，因为它基于单调时钟。
+                            // 我们在即将发送数据时，获取当前的“墙上时钟”时间（基于Unix纪元），
+                            // 这样就能与 Linux 端的时钟进行有意义的比较。
+                            val timestampNs = System.currentTimeMillis() * 1_000_000
+                            NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame, timestampNs)
+                            // AI-MOD-END
                         }
                         codec.releaseOutputBuffer(outputBufferIndex, false)
                     }

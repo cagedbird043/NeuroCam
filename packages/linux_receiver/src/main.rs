@@ -2,12 +2,12 @@
 
 // AI-MOD-START
 use protocol::{AckPacket, DataHeader, PacketType, ACK_PACKET_SIZE, DATA_HEADER_SIZE};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self};
 use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::UdpSocket;
 use tokio::process::{Child, Command};
@@ -15,7 +15,8 @@ use tokio::process::{Child, Command};
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
 const MAX_DATAGRAM_SIZE: usize = 65_507;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-const V4L2_DEVICE: &str = "/dev/video10"; // V4L2 虚拟设备路径
+const V4L2_DEVICE: &str = "/dev/video10";
+const LATENCY_AVG_WINDOW: usize = 60; // 计算最近60帧的平均延迟
 
 struct FrameReassembler {
     packets: Vec<Option<Vec<u8>>>,
@@ -23,19 +24,21 @@ struct FrameReassembler {
     total_packets: u16,
     last_seen: Instant,
     is_key_frame: bool,
+    capture_timestamp_ns: u64, // 新增：存储帧的原始时间戳
 }
 
 impl FrameReassembler {
-    fn new(total_packets: u16, is_key_frame: bool) -> Self {
+    fn new(header: &DataHeader) -> Self {
         FrameReassembler {
-            packets: vec![None; total_packets as usize],
+            packets: vec![None; header.total_packets as usize],
             received_count: 0,
-            total_packets,
+            total_packets: header.total_packets,
             last_seen: Instant::now(),
-            is_key_frame,
+            is_key_frame: header.is_key_frame != 0,
+            capture_timestamp_ns: header.capture_timestamp_ns,
         }
     }
-
+    // ... add_packet 无变化
     fn add_packet(&mut self, packet_id: u16, data: Vec<u8>) -> Option<Vec<u8>> {
         let id = packet_id as usize;
         if id < self.packets.len() && self.packets[id].is_none() {
@@ -56,36 +59,45 @@ impl FrameReassembler {
     }
 }
 
+// ... spawn_ffmpeg 无变化
 fn spawn_ffmpeg() -> io::Result<Child> {
     println!("[FFmpeg] Spawning ffmpeg to feed {}", V4L2_DEVICE);
+    // AI-MOD-START
     Command::new("ffmpeg")
         .args([
-            "-hide_banner", // 隐藏冗余的启动信息
+            "-hide_banner",
             "-loglevel",
-            "error", // 只输出错误日志
+            "error",
+            // --- 低延迟优化核心 ---
+            "-fflags",
+            "nobuffer", // 禁用 avformat 层的缓冲
+            "-flags",
+            "low_delay", // 提示 avcodec 层使用低延迟模式
+            // --- 优化结束 ---
             "-probesize",
-            "32", // 快速启动
+            "32",
             "-analyzeduration",
             "0",
             "-f",
-            "h264", // 输入格式为H.264码流
+            "h264",
             "-i",
-            "pipe:0", // 从标准输入读取数据
+            "pipe:0",
             "-f",
-            "v4l2", // 输出格式为V4L2
+            "v4l2",
             "-pix_fmt",
-            "yuv420p", // V4L2设备常用的像素格式
+            "yuv420p",
             V4L2_DEVICE,
         ])
-        .stdin(Stdio::piped()) // 创建一个可以写入的stdin管道
-        .stdout(Stdio::null()) // 忽略ffmpeg的正常输出
-        .stderr(Stdio::piped()) // 捕获ffmpeg的错误输出以便调试
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
+    // AI-MOD-END
 }
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    println!("[NeuroCam Linux Receiver - v8.0 FINAL]");
+    println!("[NeuroCam Linux Receiver - v8.1 LATENCY TEST]");
     println!("Starting UDP listener on {}...", LISTEN_ADDR);
 
     let mut ffmpeg_process = spawn_ffmpeg()?;
@@ -95,7 +107,6 @@ async fn main() -> io::Result<()> {
             .take()
             .expect("Failed to open ffmpeg stdin"),
     );
-    // 捕获 ffmpeg 的错误输出并异步打印
     if let Some(mut stderr) = ffmpeg_process.stderr.take() {
         tokio::spawn(async move {
             let mut reader = tokio::io::BufReader::new(&mut stderr);
@@ -122,34 +133,28 @@ async fn main() -> io::Result<()> {
 
     let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
     let mut reassemblers: HashMap<u32, FrameReassembler> = HashMap::new();
+    // 新增：用于计算移动平均延迟的队列
+    let mut latency_history: VecDeque<f64> = VecDeque::with_capacity(LATENCY_AVG_WINDOW);
 
     loop {
-        // 使用 tokio::select 来同时监听 UDP 包和 ffmpeg 进程退出
         tokio::select! {
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((len, remote_addr)) => {
-                        handle_udp_packet(len, &buf, &remote_addr, &mut reassemblers, &mut ffmpeg_stdin, &socket).await;
+                        handle_udp_packet(len, &buf, &remote_addr, &mut reassemblers, &mut ffmpeg_stdin, &socket, &mut latency_history).await;
                     }
-                    Err(e) => {
-                        eprintln!("[ERROR] Error receiving UDP packet: {}", e);
-                        break;
-                    }
+                    Err(e) => { eprint!("[ERROR] Error receiving UDP packet: {}", e); break; }
                 }
             },
-            _ = ffmpeg_process.wait() => {
-                eprintln!("[ERROR] FFmpeg process exited unexpectedly. Shutting down.");
-                break;
-            }
+            _ = ffmpeg_process.wait() => { eprint!("[ERROR] FFmpeg process exited unexpectedly. Shutting down."); break; }
         }
     }
-
+    // ... shutdown 逻辑无变化
     println!("Shutting down... Closing ffmpeg pipe.");
-    ffmpeg_stdin.shutdown().await?; // 确保所有缓冲数据都写入管道，并关闭它
+    ffmpeg_stdin.shutdown().await?;
     println!("Waiting for ffmpeg process to terminate...");
     let _ = ffmpeg_process.wait().await;
     println!("NeuroCam Receiver has shut down cleanly.");
-
     Ok(())
 }
 
@@ -159,23 +164,45 @@ async fn handle_udp_packet(
     remote_addr: &SocketAddr,
     reassemblers: &mut HashMap<u32, FrameReassembler>,
     writer: &mut (impl AsyncWrite + Unpin),
-    // AI-MOD-START
-    // 核心修复 1: 函数签名现在正确地期望一个对 Arc<UdpSocket> 的引用。
     socket: &Arc<UdpSocket>,
-    // AI-MOD-END
+    latency_history: &mut VecDeque<f64>, // 新增
 ) {
     if len > 0 {
         if let Ok(packet_type) = PacketType::try_from(buf[0]) {
             if packet_type == PacketType::Data {
                 if let Some(header) = DataHeader::from_bytes(&buf[1..len]) {
-                    let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
-                    let is_key_frame = header.is_key_frame != 0;
-                    let reassembler = reassemblers.entry(header.frame_id).or_insert_with(|| {
-                        FrameReassembler::new(header.total_packets, is_key_frame)
-                    });
+                    let reassembler = reassemblers
+                        .entry(header.frame_id)
+                        .or_insert_with(|| FrameReassembler::new(&header));
 
+                    let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
                     if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload)
                     {
+                        // --- 延迟计算核心逻辑 ---
+                        let arrival_time_ns = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos() as u64;
+                        let latency_ns =
+                            arrival_time_ns.saturating_sub(reassembler.capture_timestamp_ns);
+                        let latency_ms = latency_ns as f64 / 1_000_000.0;
+
+                        if latency_history.len() >= LATENCY_AVG_WINDOW {
+                            latency_history.pop_front();
+                        }
+                        latency_history.push_back(latency_ms);
+                        let avg_latency: f64 =
+                            latency_history.iter().sum::<f64>() / latency_history.len() as f64;
+
+                        println!(
+                            "[LATENCY] Frame #{}: {:.2} ms (Avg over last {} frames: {:.2} ms)",
+                            header.frame_id,
+                            latency_ms,
+                            latency_history.len(),
+                            avg_latency
+                        );
+                        // --- 延迟计算结束 ---
+
                         if let Err(e) = writer.write_all(&complete_frame).await {
                             eprintln!("[ERROR] Failed to write to ffmpeg stdin: {}", e);
                         }
@@ -194,16 +221,11 @@ async fn handle_udp_packet(
             }
         }
     }
-
-    // 超时检查逻辑
+    // ... 超时检查逻辑无变化
     reassemblers.retain(|_frame_id, reassembler| {
         if reassembler.last_seen.elapsed() > FRAME_TIMEOUT {
             if !reassembler.is_key_frame {
-                // AI-MOD-START
-                // 核心修复 2: 在需要创建异步任务时，才从外部的 Arc<UdpSocket> 克隆一个新的 Arc。
-                // 这样每次 spawn 都会得到一个新的、自己的 Arc 副本，解决了所有权和 move 的问题。
                 let socket_for_task = Arc::clone(socket);
-                // AI-MOD-END
                 let remote_addr_clone = *remote_addr;
                 tokio::spawn(async move {
                     let request = [PacketType::IFrameRequest as u8];
