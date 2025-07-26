@@ -5,10 +5,16 @@ name = "linux_receiver"
 version = "0.1.0"
 edition = "2021"
 
-# AI-MOD-START
 [dependencies]
 # 引入我们自定义的传输协议 crate
 protocol = { path = "../protocol" }
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
-# AI-MOD-END
+# GStreamer 核心库
+gstreamer = "0.22"
+# GStreamer app 插件库，提供 appsrc/appsink 等元素
+gstreamer-app = "0.22"
+# 关键修复：添加 gstreamer-video 以使用 VideoTestSrcPattern 枚举
+gstreamer-video = "0.22"
+# 方便的错误处理库
+anyhow = "1.0"
