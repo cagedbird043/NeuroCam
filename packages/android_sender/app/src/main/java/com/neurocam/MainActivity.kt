@@ -9,6 +9,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 // 为 CameraX 的 Preview 类指定一个别名 CameraXPreview，以避免与 Compose 的 Preview 注解冲突
 import androidx.camera.core.Preview as CameraXPreview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -22,6 +23,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -37,28 +39,39 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.neurocam.ui.theme.NeuroCamSenderTheme
-
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
-    // private external fun initRust() // 我们稍后会用到它
-
-    companion object {
-        private const val TAG = "NeuroCam/MainActivity"
-        init {
-            // 确保在任何 JNI 调用之前加载 Rust 库
-            System.loadLibrary("android_sender")
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // AI-MOD-START
+        // 核心修复：将 NativeBridge.init() 移到后台线程。
+        // lifecycleScope 会将协程的生命周期与 Activity 绑定，当 Activity 销毁时自动取消。
+        // Dispatchers.IO 是专门为网络和磁盘 I/O 操作优化的线程池。
+        lifecycleScope.launch(Dispatchers.IO) {
+            NativeBridge.init()
+            Log.i("NeuroCam/MainActivity", "NativeBridge initialized on a background thread.")
+        }
+        // AI-MOD-END
+
         enableEdgeToEdge()
         setContent {
             NeuroCamSenderTheme {
                 MainScreen()
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // close() 通常不涉及网络，可以保持原样，但为了对称性，也可以移到后台线程。
+        // 这里我们暂时保持不动，因为它目前是空的。
+        NativeBridge.close()
+        Log.i("NeuroCam/MainActivity", "NativeBridge closed.")
     }
 }
 
@@ -104,12 +117,17 @@ fun MainScreen(modifier: Modifier = Modifier) {
     }
 }
 
-
 @Composable
 fun CameraPreview(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
+    val cameraExecutor = remember { java.util.concurrent.Executors.newSingleThreadExecutor() }
+
+    // AI-MOD-START
+    // 核心修复：将 videoEncoder 变为可空状态，我们将在收到第一帧时才初始化它。
+    var videoEncoder: VideoEncoder? by remember { mutableStateOf(null) }
+    // AI-MOD-END
 
     AndroidView(
         factory = { ctx ->
@@ -120,14 +138,44 @@ fun CameraPreview(modifier: Modifier = Modifier) {
             cameraProviderFuture.addListener({
                 val cameraProvider = cameraProviderFuture.get()
 
-                // AI-MOD-START
-                // 使用我们定义的别名 CameraXPreview 来创建用例，代码清晰无歧义
                 val preview = CameraXPreview.Builder()
                     .build()
                     .also {
                         it.setSurfaceProvider(previewView.surfaceProvider)
                     }
-                // AI-MOD-END
+
+                val imageAnalyzer = androidx.camera.core.ImageAnalysis.Builder()
+                    .setBackpressureStrategy(androidx.camera.core.ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    // 我们仍然可以建议一个目标分辨率，但最终以实际输出为准。
+                    .setTargetResolution(android.util.Size(640, 480))
+                    .build()
+                    .also {
+                        it.setAnalyzer(cameraExecutor, androidx.camera.core.ImageAnalysis.Analyzer { imageProxy ->
+                            // AI-MOD-START
+                            // --- 动态自适应逻辑 ---
+                            // 检查编码器是否已初始化
+                            if (videoEncoder == null) {
+                                // 这是第一帧，是初始化编码器的最佳时机
+                                val actualWidth = imageProxy.width
+                                val actualHeight = imageProxy.height
+
+                                Log.i("NeuroCam/CameraPreview", "First frame received. " +
+                                        "Actual resolution: ${actualWidth}x${actualHeight}. Initializing encoder.")
+
+                                // 使用从 ImageProxy 获取的真实尺寸来创建和启动编码器
+                                videoEncoder = VideoEncoder(width = actualWidth, height = actualHeight).apply {
+                                    start()
+                                }
+                            }
+
+                            // 将图像帧传递给已初始化的编码器
+                            videoEncoder?.encodeFrame(imageProxy)
+                            // --- 动态自适应逻辑结束 ---
+                            // AI-MOD-END
+
+                            imageProxy.close()
+                        })
+                    }
 
                 val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
@@ -137,8 +185,10 @@ fun CameraPreview(modifier: Modifier = Modifier) {
                     cameraProvider.bindToLifecycle(
                         lifecycleOwner,
                         cameraSelector,
-                        preview
+                        preview,
+                        imageAnalyzer
                     )
+                    // 不再在这里启动编码器，因为它尚未被创建
                 } catch (exc: Exception) {
                     Log.e("NeuroCam/CameraPreview", "用例绑定失败", exc)
                 }
@@ -148,9 +198,18 @@ fun CameraPreview(modifier: Modifier = Modifier) {
         },
         modifier = modifier.fillMaxSize()
     )
+
+    DisposableEffect(Unit) {
+        onDispose {
+            Log.d("NeuroCam/MainScreen", "Disposing resources...")
+            cameraExecutor.shutdown()
+            // AI-MOD-START
+            // 安全地停止可能已被创建的编码器
+            videoEncoder?.stop()
+            // AI-MOD-END
+        }
+    }
 }
-
-
 
 @Composable
 fun PermissionDeniedScreen(
