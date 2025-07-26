@@ -1,64 +1,128 @@
-// --- packages/linux_receiver/src/main.rs
+// --- packages/linux_receiver/src/main.rs ---
 
+// AI-MOD-START
+use protocol::{PacketHeader, HEADER_SIZE};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
 const MAX_DATAGRAM_SIZE: usize = 65_507;
-const OUTPUT_FILENAME: &str = "output.mp4"; // 我们将接收到的码流保存到这个文件
+// 输出文件现在是原始H.264码流，用.h264后缀更准确
+const OUTPUT_FILENAME: &str = "output.h264";
+// 如果一个帧在5秒内没有收到任何新分片，就认为它已经丢失并丢弃
+const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 用于重组单个视频帧的结构体
+struct FrameReassembler {
+    packets: Vec<Option<Vec<u8>>>,
+    received_count: u16,
+    total_packets: u16,
+    last_seen: Instant,
+}
+
+impl FrameReassembler {
+    fn new(total_packets: u16) -> Self {
+        FrameReassembler {
+            packets: vec![None; total_packets as usize],
+            received_count: 0,
+            total_packets,
+            last_seen: Instant::now(),
+        }
+    }
+
+    /// 添加一个分片，如果帧已完成则返回完整的帧数据
+    fn add_packet(&mut self, packet_id: u16, data: Vec<u8>) -> Option<Vec<u8>> {
+        let id = packet_id as usize;
+        if id < self.packets.len() && self.packets[id].is_none() {
+            self.packets[id] = Some(data);
+            self.received_count += 1;
+        }
+        self.last_seen = Instant::now();
+
+        if self.received_count == self.total_packets {
+            // 所有分片已集齐，拼接它们
+            let total_size = self.packets.iter().map(|p| p.as_ref().unwrap().len()).sum();
+            let mut frame_data = Vec::with_capacity(total_size);
+            for packet in self.packets.iter_mut() {
+                frame_data.extend_from_slice(packet.take().unwrap().as_slice());
+            }
+            Some(frame_data)
+        } else {
+            None
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    println!("[NeuroCam Linux Receiver]");
+    println!("[NeuroCam Linux Receiver - v5.1 with Reassembly]");
     println!("Starting UDP listener on {}...", LISTEN_ADDR);
     println!(
-        "Received H.264 stream will be saved to '{}'",
+        "Reassembled H.264 stream will be saved to '{}'",
         OUTPUT_FILENAME
     );
 
-    // 1. 绑定 UDP Socket
     let socket = UdpSocket::bind(LISTEN_ADDR).await?;
-    println!("Successfully bound to {}", LISTEN_ADDR);
-
-    // 2. 创建一个文件用于写入
-    // File::create会创建一个新文件，如果文件已存在，则会清空其内容。
     let output_file = File::create(OUTPUT_FILENAME)?;
-
-    // 3. 使用 BufWriter 提升写入性能
-    // BufWriter 会在内存中创建一个缓冲区。数据先写入缓冲区，
-    // 当缓冲区满或我们手动刷新时，才一次性写入磁盘。这比每次都直接写磁盘要快得多。
     let mut writer = BufWriter::new(output_file);
-
-    // 4. 创建接收缓冲区
     let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
 
-    // 5. 进入主接收循环
+    // 使用 HashMap 存储正在重组的帧
+    let mut reassemblers: HashMap<u32, FrameReassembler> = HashMap::new();
+
     loop {
         match socket.recv_from(&mut buf).await {
-            Ok((len, remote_addr)) => {
-                // 当成功接收到一个数据包
-                println!("Received {} bytes from {}", len, remote_addr);
+            Ok((len, _)) => {
+                let Some(header) = PacketHeader::from_bytes(&buf[..len]) else {
+                    eprintln!("Received a malformed packet (invalid header).");
+                    continue;
+                };
 
-                // 将接收到的有效数据 (切片 buf[..len]) 写入 BufWriter
-                if let Err(e) = writer.write_all(&buf[..len]) {
-                    // 如果写入失败，打印错误并退出程序
-                    eprintln!("Error writing to file: {}", e);
-                    break;
+                let payload = buf[HEADER_SIZE..len].to_vec();
+
+                let reassembler = reassemblers
+                    .entry(header.frame_id)
+                    .or_insert_with(|| FrameReassembler::new(header.total_packets));
+
+                if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
+                    println!(
+                        "Frame #{} reassembled successfully ({} bytes). Writing to file.",
+                        header.frame_id,
+                        complete_frame.len()
+                    );
+                    if let Err(e) = writer.write_all(&complete_frame) {
+                        eprintln!("Error writing to file: {}", e);
+                        break; // 写入失败是严重错误，退出循环
+                    }
+                    // 帧处理完毕，从缓存中移除
+                    reassemblers.remove(&header.frame_id);
                 }
             }
             Err(e) => {
-                // 当接收发生错误时
                 eprintln!("Error receiving UDP packet: {}", e);
                 break;
             }
         }
+
+        // 清理超时的帧
+        reassemblers.retain(|frame_id, reassembler| {
+            if reassembler.last_seen.elapsed() > FRAME_TIMEOUT {
+                println!(
+                    "Frame #{} timed out. Discarding {} of {} received packets.",
+                    frame_id, reassembler.received_count, reassembler.total_packets
+                );
+                false
+            } else {
+                true
+            }
+        });
     }
 
-    // 程序退出循环前（例如发生错误时），确保所有缓冲的数据都被写入磁盘。
-    // writer.flush() 会执行这个操作。
     println!("Flushing buffer and shutting down...");
     writer.flush()?;
-
     Ok(())
 }
+// AI-MOD-END

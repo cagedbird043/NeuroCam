@@ -9,9 +9,10 @@ edition = "2021"
 # 声明这是一个动态库，供 JNI 调用
 crate-type = ["cdylib"]
 
+# AI-MOD-START
 [dependencies]
 # 我们与 Kotlin/Java 交互的唯一桥梁
 jni = "0.21.1"
-# AI-MOD-START
-# lazy_static 已被移除，不再需要
+# 引入我们自定义的传输协议 crate
+protocol = { path = "../protocol" }
 # AI-MOD-END

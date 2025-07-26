@@ -1,12 +1,14 @@
-# --- packages/linux_receiver/Cargo.toml
+# --- packages/linux_receiver/Cargo.toml ---
 
 [package]
 name = "linux_receiver"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
+# AI-MOD-START
 [dependencies]
+# 引入我们自定义的传输协议 crate
 protocol = { path = "../protocol" }
-tokio = { version = "1", features = ["full"] } # <-- 添加此行
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+# AI-MOD-END
