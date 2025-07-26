@@ -1,12 +1,14 @@
 // --- packages/linux_receiver/src/main.rs ---
 
-use anyhow::{anyhow, Result};
+// AI-MOD-START
+// 关键修复 (清理): 移除未使用的 use 语句，消除编译器警告。
+use anyhow::Result;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
 use protocol::{AckPacket, DataHeader, PacketType, ACK_PACKET_SIZE, DATA_HEADER_SIZE};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,11 +18,10 @@ use tokio::time::sleep;
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
 const MAX_DATAGRAM_SIZE: usize = 65_507;
 const V4L2_DEVICE: &str = "/dev/video10";
-const LATENCY_AVG_WINDOW: usize = 60;
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
+const HANDSHAKE_INTERVAL: Duration = Duration::from_millis(500);
 
-// AI-MOD-START
-// 关键修复 (结构错误): 将 FrameReassembler 的定义移到文件顶部，以便 main 和其他函数可以找到它。
+// 关键修复 (结构错误): 将 FrameReassembler 的定义移到文件顶部。
 struct FrameReassembler {
     packets: Vec<Option<Vec<u8>>>,
     received_count: u16,
@@ -63,59 +64,81 @@ impl FrameReassembler {
 }
 // AI-MOD-END
 
-struct VideoPipeline {
+struct GstreamerPipeline {
     pipeline: gst::Pipeline,
     appsrc: gst_app::AppSrc,
-    start_time: Instant,
+    input_selector: gst::Element,
+    standby_pad: gst::Pad,
+    network_pad: gst::Pad,
 }
 
-fn create_and_run_standby_pipeline() -> Result<gst::Pipeline> {
-    let pipeline_str = format!(
-        "videotestsrc is-live=true pattern=black ! videoconvert ! video/x-raw,format=YUY2 ! v4l2sink device={}",
-        V4L2_DEVICE
-    );
-    let pipeline = gst::parse::launch(&pipeline_str)?
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| anyhow!("Failed to create standby pipeline"))?;
+fn create_final_pipeline() -> Result<GstreamerPipeline> {
+    gst::init()?;
 
-    pipeline.set_state(gst::State::Playing)?;
-    Ok(pipeline)
-}
+    let pipeline = gst::Pipeline::new();
+    let appsrc_elem = gst::ElementFactory::make("appsrc").name("netsrc").build()?;
+    let videotestsrc = gst::ElementFactory::make("videotestsrc")
+        .name("standbysrc")
+        .build()?;
+    let h264parse = gst::ElementFactory::make("h264parse").build()?;
+    let avdec_h264 = gst::ElementFactory::make("avdec_h264").build()?;
+    let input_selector = gst::ElementFactory::make("input-selector")
+        .name("selector")
+        .build()?;
+    let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
+    let v4l2sink = gst::ElementFactory::make("v4l2sink").build()?;
 
-fn create_video_pipeline() -> Result<VideoPipeline> {
-    let pipeline_str = format!(
-        "appsrc name=src caps=\"video/x-h264,stream-format=byte-stream\" ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=YUY2 ! v4l2sink name=sink device={}",
-        V4L2_DEVICE
-    );
-
-    let pipeline = gst::parse::launch(&pipeline_str)?
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| anyhow!("Failed to create video pipeline"))?;
-
-    let appsrc = pipeline
-        .by_name("src")
-        .unwrap()
-        .downcast::<gst_app::AppSrc>()
-        .unwrap();
-    let sink = pipeline.by_name("sink").unwrap();
-
+    let appsrc = appsrc_elem.downcast_ref::<gst_app::AppSrc>().unwrap();
+    appsrc.set_property_from_str("caps", "video/x-h264,stream-format=byte-stream");
     appsrc.set_property("is-live", true);
     appsrc.set_property("do-timestamp", true);
     appsrc.set_format(gst::Format::Time);
     appsrc.set_latency(gst::ClockTime::ZERO, gst::ClockTime::ZERO);
-    sink.set_property("sync", false);
 
-    Ok(VideoPipeline {
+    videotestsrc.set_property("is-live", true);
+    videotestsrc.set_property_from_str("pattern", "black");
+
+    v4l2sink.set_property("device", V4L2_DEVICE);
+    v4l2sink.set_property("sync", false);
+
+    pipeline.add_many(&[
+        &appsrc_elem,
+        &h264parse,
+        &avdec_h264,
+        &videotestsrc,
+        &input_selector,
+        &videoconvert,
+        &v4l2sink,
+    ])?;
+
+    let standby_pad = input_selector.request_pad_simple("sink_%u").unwrap();
+    gst::Element::link_many(&[&videotestsrc, &input_selector])?;
+
+    let network_pad = input_selector.request_pad_simple("sink_%u").unwrap();
+    gst::Element::link_many(&[&appsrc_elem, &h264parse, &avdec_h264, &input_selector])?;
+
+    gst::Element::link_many(&[&input_selector, &videoconvert, &v4l2sink])?;
+
+    println!("[GStreamer] Final unified pipeline created successfully.");
+
+    Ok(GstreamerPipeline {
         pipeline,
-        appsrc,
-        start_time: Instant::now(),
+        appsrc: appsrc.clone(),
+        input_selector,
+        standby_pad,
+        network_pad,
     })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    gst::init()?;
-    println!("[NeuroCam Linux Receiver - FINAL ARCHITECTURE]");
+    let gst_stuff = create_final_pipeline()?;
+
+    gst_stuff
+        .input_selector
+        .set_property("active-pad", &gst_stuff.standby_pad);
+    gst_stuff.pipeline.set_state(gst::State::Playing)?;
+    println!("[STATE] Standby. Pipeline running, device is openable.");
 
     let socket = Arc::new(UdpSocket::bind(LISTEN_ADDR).await?);
     println!(
@@ -125,50 +148,46 @@ async fn main() -> Result<()> {
 
     let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
     let mut reassemblers: HashMap<u32, FrameReassembler> = HashMap::new();
-    let mut latency_history: VecDeque<f64> = VecDeque::with_capacity(LATENCY_AVG_WINDOW);
 
     let mut last_packet_time = Instant::now();
-    let mut standby_pipe = Some(create_and_run_standby_pipeline()?);
-    let mut video_pipe: Option<VideoPipeline> = None;
-    println!("[STATE] Standby pipeline running. Device is openable.");
+    let mut last_handshake_time = Instant::now();
+    let mut current_remote_addr: Option<SocketAddr> = None;
+    let mut is_streaming = false;
 
     loop {
         tokio::select! {
             result = socket.recv_from(&mut buf) => {
                 if let Ok((len, remote_addr)) = result {
-                    if standby_pipe.is_some() {
-                        println!("[STATE] Signal acquired! Switching to video pipeline...");
-                        if let Some(p) = standby_pipe.take() {
-                            p.set_state(gst::State::Null)?;
-                        }
-                        let new_video_pipe = create_video_pipeline()?;
-                        new_video_pipe.pipeline.set_state(gst::State::Playing)?;
-                        video_pipe = Some(new_video_pipe);
+                    last_packet_time = Instant::now();
+                    current_remote_addr = Some(remote_addr);
 
+                    if !is_streaming {
+                        println!("[STATE] Signal acquired! Switching to network stream.");
+                        gst_stuff.input_selector.set_property("active-pad", &gst_stuff.network_pad);
+                        is_streaming = true;
+                    }
+
+                    handle_udp_packet(len, &buf, &remote_addr, &mut reassemblers, &gst_stuff.appsrc, &socket).await;
+                }
+            },
+            _ = sleep(HANDSHAKE_INTERVAL) => {
+                if is_streaming && last_packet_time.elapsed() > SIGNAL_TIMEOUT {
+                    println!("[STATE] Signal lost. Switching back to standby.");
+                    gst_stuff.input_selector.set_property("active-pad", &gst_stuff.standby_pad);
+                    reassemblers.clear();
+                    is_streaming = false;
+                }
+
+                if is_streaming && reassemblers.is_empty() && last_handshake_time.elapsed() > HANDSHAKE_INTERVAL {
+                     if let Some(addr) = current_remote_addr {
+                        println!("[STATE] Handshaking... Requesting I-Frame to recover stream.");
                         let request = [PacketType::IFrameRequest as u8];
                         let sock_clone = Arc::clone(&socket);
                         tokio::spawn(async move {
-                            let _ = sock_clone.send_to(&request, remote_addr).await;
+                            let _ = sock_clone.send_to(&request, addr).await;
                         });
-                        println!("[STATE] Video pipeline is now active.");
-                    }
-
-                    last_packet_time = Instant::now();
-
-                    if let Some(vp) = &mut video_pipe {
-                        handle_udp_packet(len, &buf, &remote_addr, &mut reassemblers, vp, &socket, &mut latency_history).await;
-                    }
-                }
-            },
-            _ = sleep(Duration::from_millis(500)) => {
-                if video_pipe.is_some() && last_packet_time.elapsed() > SIGNAL_TIMEOUT {
-                    println!("[STATE] Signal lost. Switching back to standby pipeline...");
-                    if let Some(vp) = video_pipe.take() {
-                        vp.pipeline.set_state(gst::State::Null)?;
-                    }
-                    standby_pipe = Some(create_and_run_standby_pipeline()?);
-                    reassemblers.clear();
-                    println!("[STATE] Standby pipeline is now active.");
+                        last_handshake_time = Instant::now();
+                     }
                 }
             }
         }
@@ -180,9 +199,8 @@ async fn handle_udp_packet(
     buf: &[u8],
     remote_addr: &SocketAddr,
     reassemblers: &mut HashMap<u32, FrameReassembler>,
-    video_pipe: &mut VideoPipeline,
+    appsrc: &gst_app::AppSrc,
     socket: &Arc<UdpSocket>,
-    latency_history: &mut VecDeque<f64>,
 ) {
     if len > 0 && PacketType::try_from(buf[0]) == Ok(PacketType::Data) {
         if let Some(header) = DataHeader::from_bytes(&buf[1..len]) {
@@ -192,37 +210,32 @@ async fn handle_udp_packet(
             let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
 
             if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
+                // AI-MOD-START
+                // 恢复有用的延迟日志打印，这会使用 reassembler.capture_timestamp_ns，从而解决 dead_code 警告。
                 let arrival_time_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_nanos() as u64;
-                let log_latency_ns =
+                let clock_skew_latency_ns =
                     arrival_time_ns.saturating_sub(reassembler.capture_timestamp_ns);
-                let log_latency_ms = log_latency_ns as f64 / 1_000_000.0;
-
-                if latency_history.len() >= LATENCY_AVG_WINDOW {
-                    latency_history.pop_front();
-                }
-                latency_history.push_back(log_latency_ms);
-
+                let clock_skew_latency_ms = clock_skew_latency_ns as f64 / 1_000_000.0;
                 println!(
                     "[FRAME] #{:<5} | Size: {:>5} KB | Clock Skew Latency: {:>7.2} ms",
                     header.frame_id,
                     complete_frame.len() / 1024,
-                    log_latency_ms
+                    clock_skew_latency_ms
                 );
+                // AI-MOD-END
 
                 let mut gst_buffer = gst::Buffer::with_size(complete_frame.len()).unwrap();
                 {
                     let mut_buffer = gst_buffer.get_mut().unwrap();
-                    let running_time = reassembler.last_seen.duration_since(video_pipe.start_time);
-                    mut_buffer
-                        .set_pts(gst::ClockTime::from_nseconds(running_time.as_nanos() as u64));
+                    mut_buffer.set_pts(gst::ClockTime::from_nseconds(arrival_time_ns));
                     mut_buffer.copy_from_slice(0, &complete_frame).unwrap();
                 }
 
-                if let Err(e) = video_pipe.appsrc.push_buffer(gst_buffer) {
-                    eprintln!("[GStreamer] Error pushing buffer: {:?}. This might indicate the pipe is shutting down.", e);
+                if let Err(e) = appsrc.push_buffer(gst_buffer) {
+                    eprintln!("[GStreamer] Error pushing buffer: {:?}.", e);
                 }
 
                 if reassembler.is_key_frame {
