@@ -1,10 +1,11 @@
 // --- packages/linux_receiver/src/main.rs ---
 
 // AI-MOD-START
-use protocol::{PacketHeader, HEADER_SIZE};
+use protocol::{AckPacket, DataHeader, PacketType, ACK_PACKET_SIZE, DATA_HEADER_SIZE};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
@@ -13,13 +14,12 @@ const MAX_DATAGRAM_SIZE: usize = 65_507;
 const OUTPUT_FILENAME: &str = "output.h264";
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 用于重组单个视频帧的结构体
 struct FrameReassembler {
     packets: Vec<Option<Vec<u8>>>,
     received_count: u16,
     total_packets: u16,
     last_seen: Instant,
-    is_key_frame: bool, // 新增：存储关键帧标记
+    is_key_frame: bool,
 }
 
 impl FrameReassembler {
@@ -33,7 +33,6 @@ impl FrameReassembler {
         }
     }
 
-    /// 添加一个分片，如果帧已完成则返回完整的帧数据
     fn add_packet(&mut self, packet_id: u16, data: Vec<u8>) -> Option<Vec<u8>> {
         let id = packet_id as usize;
         if id < self.packets.len() && self.packets[id].is_none() {
@@ -41,9 +40,7 @@ impl FrameReassembler {
             self.received_count += 1;
         }
         self.last_seen = Instant::now();
-
         if self.received_count == self.total_packets {
-            // 所有分片已集齐，拼接它们
             let total_size = self.packets.iter().map(|p| p.as_ref().unwrap().len()).sum();
             let mut frame_data = Vec::with_capacity(total_size);
             for packet in self.packets.iter_mut() {
@@ -58,7 +55,7 @@ impl FrameReassembler {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    println!("[NeuroCam Linux Receiver - v6.0 with I-Frame Detection]");
+    println!("[NeuroCam Linux Receiver - v6.1 with ACK Sender]");
     println!("Starting UDP listener on {}...", LISTEN_ADDR);
     println!(
         "Reassembled H.264 stream will be saved to '{}'",
@@ -69,38 +66,34 @@ async fn main() -> io::Result<()> {
     let output_file = File::create(OUTPUT_FILENAME)?;
     let mut writer = BufWriter::new(output_file);
     let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
-
     let mut reassemblers: HashMap<u32, FrameReassembler> = HashMap::new();
 
     loop {
         match socket.recv_from(&mut buf).await {
-            Ok((len, _)) => {
-                let Some(header) = PacketHeader::from_bytes(&buf[..len]) else {
-                    eprintln!("Received a malformed packet (invalid header).");
+            Ok((len, remote_addr)) => {
+                if len == 0 {
+                    continue;
+                }
+
+                let Ok(packet_type) = PacketType::try_from(buf[0]) else {
+                    eprintln!("Received packet with unknown type: {}", buf[0]);
                     continue;
                 };
 
-                let payload = buf[HEADER_SIZE..len].to_vec();
-                let is_key_frame = header.is_key_frame != 0;
-
-                let reassembler = reassemblers
-                    .entry(header.frame_id)
-                    .or_insert_with(|| FrameReassembler::new(header.total_packets, is_key_frame));
-
-                if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
-                    // 核心诊断逻辑
-                    if reassembler.is_key_frame {
-                        println!("[KEY FRAME] Frame #{} reassembled successfully ({} bytes). Writing to file.", header.frame_id, complete_frame.len());
-                    } else {
-                        // 为了保持控制台清爽，可以注释掉非关键帧的日志
-                        // println!("Frame #{} reassembled ({} bytes).", header.frame_id, complete_frame.len());
+                match packet_type {
+                    PacketType::Data => {
+                        handle_data_packet(
+                            &buf[1..len],
+                            &mut reassemblers,
+                            &mut writer,
+                            &socket,
+                            &remote_addr,
+                        )
+                        .await;
                     }
-
-                    if let Err(e) = writer.write_all(&complete_frame) {
-                        eprintln!("Error writing to file: {}", e);
-                        break;
+                    PacketType::Ack => {
+                        // Receiver does not process ACKs, it only sends them.
                     }
-                    reassemblers.remove(&header.frame_id);
                 }
             }
             Err(e) => {
@@ -130,5 +123,53 @@ async fn main() -> io::Result<()> {
     println!("Flushing buffer and shutting down...");
     writer.flush()?;
     Ok(())
+}
+
+async fn handle_data_packet(
+    data: &[u8],
+    reassemblers: &mut HashMap<u32, FrameReassembler>,
+    writer: &mut BufWriter<File>,
+    socket: &UdpSocket,
+    remote_addr: &SocketAddr,
+) {
+    let Some(header) = DataHeader::from_bytes(data) else {
+        eprintln!("Received a malformed data packet (invalid header).");
+        return;
+    };
+
+    let payload = data[DATA_HEADER_SIZE..].to_vec();
+    let is_key_frame = header.is_key_frame != 0;
+
+    let reassembler = reassemblers
+        .entry(header.frame_id)
+        .or_insert_with(|| FrameReassembler::new(header.total_packets, is_key_frame));
+
+    if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
+        if reassembler.is_key_frame {
+            println!(
+                "[KEY FRAME] Frame #{} reassembled successfully. Sending ACK.",
+                header.frame_id
+            );
+            // --- 发送 ACK ---
+            let ack = AckPacket {
+                frame_id: header.frame_id,
+            };
+            let mut ack_buf = [0u8; 1 + ACK_PACKET_SIZE];
+            ack_buf[0] = PacketType::Ack as u8;
+            ack_buf[1..].copy_from_slice(&ack.to_bytes());
+            if let Err(e) = socket.send_to(&ack_buf, remote_addr).await {
+                eprintln!(
+                    "[ERROR] Failed to send ACK for frame #{}: {}",
+                    header.frame_id, e
+                );
+            }
+            // --- ACK 发送完毕 ---
+        }
+
+        if let Err(e) = writer.write_all(&complete_frame) {
+            eprintln!("Error writing to file: {}", e);
+        }
+        reassemblers.remove(&header.frame_id);
+    }
 }
 // AI-MOD-END
