@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
@@ -23,6 +24,7 @@ struct FrameReassembler {
 }
 
 impl FrameReassembler {
+    // ... (此部分无变化，保持原样)
     fn new(total_packets: u16, is_key_frame: bool) -> Self {
         FrameReassembler {
             packets: vec![None; total_packets as usize],
@@ -55,14 +57,16 @@ impl FrameReassembler {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    println!("[NeuroCam Linux Receiver - v6.1 with ACK Sender]");
+    // AI-MOD-START
+    println!("[NeuroCam Linux Receiver - v7.0 with Active Error Recovery]");
     println!("Starting UDP listener on {}...", LISTEN_ADDR);
     println!(
         "Reassembled H.264 stream will be saved to '{}'",
         OUTPUT_FILENAME
     );
 
-    let socket = UdpSocket::bind(LISTEN_ADDR).await?;
+    // 将 socket 包装在 Arc 中，以便在异步任务间安全共享
+    let socket = Arc::new(UdpSocket::bind(LISTEN_ADDR).await?);
     let output_file = File::create(OUTPUT_FILENAME)?;
     let mut writer = BufWriter::new(output_file);
     let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
@@ -71,58 +75,74 @@ async fn main() -> io::Result<()> {
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, remote_addr)) => {
-                if len == 0 {
-                    continue;
-                }
-
-                let Ok(packet_type) = PacketType::try_from(buf[0]) else {
-                    eprintln!("Received packet with unknown type: {}", buf[0]);
-                    continue;
-                };
-
-                match packet_type {
-                    PacketType::Data => {
-                        handle_data_packet(
-                            &buf[1..len],
-                            &mut reassemblers,
-                            &mut writer,
-                            &socket,
-                            &remote_addr,
-                        )
-                        .await;
-                    }
-                    PacketType::Ack => {
-                        // Receiver does not process ACKs, it only sends them.
+                // 收到包之后，立即处理它
+                if len > 0 {
+                    if let Ok(packet_type) = PacketType::try_from(buf[0]) {
+                        match packet_type {
+                            PacketType::Data => {
+                                handle_data_packet(
+                                    &buf[1..len],
+                                    &mut reassemblers,
+                                    &mut writer,
+                                    &socket,
+                                    &remote_addr,
+                                )
+                                .await;
+                            }
+                            _ => { /* Receiver ignores other packet types */ }
+                        }
+                    } else {
+                        eprintln!("Received packet with unknown type: {}", buf[0]);
                     }
                 }
+
+                // --- 超时检查逻辑 ---
+                // 在处理完当前包后，顺便检查所有帧的超时情况
+                let socket_for_timeout = Arc::clone(&socket);
+                reassemblers.retain(|frame_id, reassembler| {
+                    if reassembler.last_seen.elapsed() > FRAME_TIMEOUT {
+                        let frame_type = if reassembler.is_key_frame {
+                            "KEY FRAME"
+                        } else {
+                            "Frame"
+                        };
+                        println!(
+                            "[TIMEOUT] {} #{} timed out. Discarding {} of {} received packets.",
+                            frame_type,
+                            frame_id,
+                            reassembler.received_count,
+                            reassembler.total_packets
+                        );
+
+                        if !reassembler.is_key_frame {
+                            // 修复 'move' 错误：为异步任务克隆 Arc
+                            let socket_for_task = Arc::clone(&socket_for_timeout);
+                            println!("[RECOVERY] Requesting a new I-Frame due to lost P/B-frame.");
+                            tokio::spawn(async move {
+                                let request = [PacketType::IFrameRequest as u8];
+                                if let Err(e) = socket_for_task.send_to(&request, remote_addr).await
+                                {
+                                    eprintln!("[ERROR] Failed to send I-Frame Request: {}", e);
+                                }
+                            });
+                        }
+                        false // 从 reassemblers 中移除超时的条目
+                    } else {
+                        true // 保留未超时的条目
+                    }
+                });
             }
             Err(e) => {
                 eprintln!("Error receiving UDP packet: {}", e);
                 break;
             }
         }
-
-        reassemblers.retain(|frame_id, reassembler| {
-            if reassembler.last_seen.elapsed() > FRAME_TIMEOUT {
-                let frame_type = if reassembler.is_key_frame {
-                    "KEY FRAME"
-                } else {
-                    "Frame"
-                };
-                println!(
-                    "[TIMEOUT] {} #{} timed out. Discarding {} of {} received packets.",
-                    frame_type, frame_id, reassembler.received_count, reassembler.total_packets
-                );
-                false
-            } else {
-                true
-            }
-        });
     }
 
     println!("Flushing buffer and shutting down...");
     writer.flush()?;
     Ok(())
+    // AI-MOD-END
 }
 
 async fn handle_data_packet(
@@ -150,7 +170,6 @@ async fn handle_data_packet(
                 "[KEY FRAME] Frame #{} reassembled successfully. Sending ACK.",
                 header.frame_id
             );
-            // --- 发送 ACK ---
             let ack = AckPacket {
                 frame_id: header.frame_id,
             };
@@ -163,7 +182,6 @@ async fn handle_data_packet(
                     header.frame_id, e
                 );
             }
-            // --- ACK 发送完毕 ---
         }
 
         if let Err(e) = writer.write_all(&complete_frame) {

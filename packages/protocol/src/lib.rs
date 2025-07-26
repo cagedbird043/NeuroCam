@@ -1,6 +1,5 @@
 // --- packages/protocol/src/lib.rs ---
 
-// AI-MOD-START
 //! 定义了 NeuroCam 项目中用于网络传输的UDP分片与重组协议。
 use std::mem::size_of;
 
@@ -12,6 +11,7 @@ use std::mem::size_of;
 pub enum PacketType {
     Data = 0,
     Ack = 1,
+    IFrameRequest = 2, // 新增：用于请求关键帧
 }
 
 impl TryFrom<u8> for PacketType {
@@ -21,6 +21,7 @@ impl TryFrom<u8> for PacketType {
         match value {
             0 => Ok(PacketType::Data),
             1 => Ok(PacketType::Ack),
+            2 => Ok(PacketType::IFrameRequest),
             _ => Err(()),
         }
     }
@@ -69,7 +70,6 @@ impl DataHeader {
 }
 
 // --- 确认包 (ACK) 相关 ---
-
 pub const ACK_PACKET_SIZE: usize = size_of::<u32>();
 
 /// 确认包的结构。
@@ -117,4 +117,3 @@ mod tests {
         assert_eq!(ack, reconstructed);
     }
 }
-// AI-MOD-END

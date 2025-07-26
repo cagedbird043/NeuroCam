@@ -117,6 +117,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
     }
 }
 
+
+// --- packages/android_sender/app/src/main/java/com/neurocam/MainActivity.kt ---
+
 @Composable
 fun CameraPreview(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -124,10 +127,20 @@ fun CameraPreview(modifier: Modifier = Modifier) {
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
     val cameraExecutor = remember { java.util.concurrent.Executors.newSingleThreadExecutor() }
 
-    // AI-MOD-START
-    // 核心修复：将 videoEncoder 变为可空状态，我们将在收到第一帧时才初始化它。
     var videoEncoder: VideoEncoder? by remember { mutableStateOf(null) }
-    // AI-MOD-END
+
+    // --- 监听来自 Rust 的 I-Frame 请求 ---
+    LaunchedEffect(videoEncoder) {
+        // 只有当 videoEncoder 被创建后才开始监听
+        videoEncoder?.let { encoder ->
+            NativeBridge.keyFrameRequestFlow.collect {
+                // 当我们从 Flow 收到一个事件时
+                Log.d("NeuroCam/CameraPreview", "Received key frame request from native layer.")
+                encoder.requestKeyFrame()
+            }
+        }
+    }
+    // --- 监听结束 ---
 
     AndroidView(
         factory = { ctx ->
@@ -146,33 +159,20 @@ fun CameraPreview(modifier: Modifier = Modifier) {
 
                 val imageAnalyzer = androidx.camera.core.ImageAnalysis.Builder()
                     .setBackpressureStrategy(androidx.camera.core.ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    // 我们仍然可以建议一个目标分辨率，但最终以实际输出为准。
                     .setTargetResolution(android.util.Size(640, 480))
                     .build()
                     .also {
                         it.setAnalyzer(cameraExecutor, androidx.camera.core.ImageAnalysis.Analyzer { imageProxy ->
-                            // AI-MOD-START
-                            // --- 动态自适应逻辑 ---
-                            // 检查编码器是否已初始化
                             if (videoEncoder == null) {
-                                // 这是第一帧，是初始化编码器的最佳时机
                                 val actualWidth = imageProxy.width
                                 val actualHeight = imageProxy.height
-
                                 Log.i("NeuroCam/CameraPreview", "First frame received. " +
                                         "Actual resolution: ${actualWidth}x${actualHeight}. Initializing encoder.")
-
-                                // 使用从 ImageProxy 获取的真实尺寸来创建和启动编码器
                                 videoEncoder = VideoEncoder(width = actualWidth, height = actualHeight).apply {
                                     start()
                                 }
                             }
-
-                            // 将图像帧传递给已初始化的编码器
                             videoEncoder?.encodeFrame(imageProxy)
-                            // --- 动态自适应逻辑结束 ---
-                            // AI-MOD-END
-
                             imageProxy.close()
                         })
                     }
@@ -181,14 +181,12 @@ fun CameraPreview(modifier: Modifier = Modifier) {
 
                 try {
                     cameraProvider.unbindAll()
-
                     cameraProvider.bindToLifecycle(
                         lifecycleOwner,
                         cameraSelector,
                         preview,
                         imageAnalyzer
                     )
-                    // 不再在这里启动编码器，因为它尚未被创建
                 } catch (exc: Exception) {
                     Log.e("NeuroCam/CameraPreview", "用例绑定失败", exc)
                 }
@@ -203,10 +201,7 @@ fun CameraPreview(modifier: Modifier = Modifier) {
         onDispose {
             Log.d("NeuroCam/MainScreen", "Disposing resources...")
             cameraExecutor.shutdown()
-            // AI-MOD-START
-            // 安全地停止可能已被创建的编码器
             videoEncoder?.stop()
-            // AI-MOD-END
         }
     }
 }

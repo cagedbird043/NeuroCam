@@ -4,6 +4,7 @@ package com.neurocam
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Bundle
 import android.util.Log
 import androidx.camera.core.ImageProxy
 
@@ -19,11 +20,32 @@ class VideoEncoder(
         private const val TAG = "NeuroCam/VideoEncoder"
         private const val MIME_TYPE = "video/avc" // H.264
         private const val FRAME_RATE = 30
-        private const val I_FRAME_INTERVAL = 1 // 1 秒一个 I 帧
+        private const val I_FRAME_INTERVAL = 1 // 1 秒一个 I-帧
     }
 
     private var mediaCodec: MediaCodec? = null
     private var isRunning = false
+
+    // AI-MOD-START
+    /**
+     *  请求编码器立即生成一个关键帧 (I-frame)。
+     *  这是一个异步请求，编码器将在下一个可用的时机生成I-frame。
+     */
+    fun requestKeyFrame() {
+        if (!isRunning || mediaCodec == null) {
+            Log.w(TAG, "Cannot request key frame, encoder is not running.")
+            return
+        }
+        try {
+            Log.i(TAG, "Actively requesting a new I-Frame...")
+            val params = Bundle()
+            params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            mediaCodec?.setParameters(params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to request key frame", e)
+        }
+    }
+    // AI-MOD-END
 
     fun start() {
         if (isRunning) {
@@ -62,10 +84,6 @@ class VideoEncoder(
         }
     }
 
-    /**
-     * 对单帧图像进行编码 (添加了诊断日志)。
-     * @param imageProxy 来自 CameraX 的图像帧。
-     */
     fun encodeFrame(imageProxy: ImageProxy) {
         if (!isRunning) return
         val codec = mediaCodec ?: return
@@ -94,17 +112,11 @@ class VideoEncoder(
                     outputBufferIndex >= 0 -> {
                         val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                         if (outputBuffer != null && bufferInfo.size > 0) {
-                            // AI-MOD-START
-                            // 核心修改：检查 bufferInfo 的 flags 字段，判断是否为关键帧 (I-frame)
-                            // MediaCodec.BUFFER_FLAG_KEY_FRAME 是一个标志位
                             val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                             if (isKeyFrame) {
                                 Log.i(TAG, "Key Frame (I-frame) encoded. Size: ${bufferInfo.size}")
                             }
-
-                            // 调用新的 JNI 函数，将 isKeyFrame 作为第三个参数传递
                             NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame)
-                            // AI-MOD-END
                         }
                         codec.releaseOutputBuffer(outputBufferIndex, false)
                     }
