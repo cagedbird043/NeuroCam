@@ -1,29 +1,27 @@
 package com.neurocam
-
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
-import android.util.Size
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.CameraSelector
+// 为 CameraX 的 Preview 类指定一个别名 CameraXPreview，以避免与 Compose 的 Preview 注解冲突
+import androidx.camera.core.Preview as CameraXPreview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,15 +32,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.tooling.preview.Preview // Compose 的 Preview 注解保持原名
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import android.graphics.Matrix
-import android.graphics.SurfaceTexture
-import android.view.TextureView
-import androidx.compose.foundation.layout.fillMaxWidth
 import com.neurocam.ui.theme.NeuroCamSenderTheme
+
 
 class MainActivity : ComponentActivity() {
 
@@ -109,81 +104,52 @@ fun MainScreen(modifier: Modifier = Modifier) {
     }
 }
 
+
 @Composable
 fun CameraPreview(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    var previewSize by remember { mutableStateOf<Size?>(null) }
+    val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
-    val cameraHelper = remember {
-        CameraHelper(context, object : CameraHelper.Listener {
-            override fun onCameraStarted() {
-                Log.i("NeuroCam/CameraPreview", "Listener: Camera has started successfully.")
+    AndroidView(
+        factory = { ctx ->
+            val previewView = PreviewView(ctx).apply {
+                this.scaleType = PreviewView.ScaleType.FILL_CENTER
             }
-            override fun onCameraError(error: String) {
-                Log.e("NeuroCam/CameraPreview", "Listener: Camera error: $error")
-            }
-            override fun onPreviewSizeSelected(size: Size) {
-                Log.d("NeuroCam/CameraPreview", "PreviewSizeSelected: ${size.width}x${size.height}")
-                previewSize = size
-            }
-        })
-    }
 
-    DisposableEffect(lifecycleOwner) {
-        onDispose {
-            Log.i("NeuroCam/CameraPreview", "DisposableEffect: Closing camera.")
-            cameraHelper.closeCamera()
-        }
-    }
+            cameraProviderFuture.addListener({
+                val cameraProvider = cameraProviderFuture.get()
 
-    Box(
-        modifier = modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        AndroidView(
-            factory = { ctx ->
-                TextureView(ctx).apply {
-                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-                            Log.i("NeuroCam/TextureView", "SurfaceTexture available. Starting camera.")
-                            cameraHelper.startCamera(android.view.Surface(surface))
-                        }
-                        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
-                        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
-                        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+                // AI-MOD-START
+                // 使用我们定义的别名 CameraXPreview 来创建用例，代码清晰无歧义
+                val preview = CameraXPreview.Builder()
+                    .build()
+                    .also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
                     }
-                }
-            },
-            modifier = Modifier
-                .let {
-                    if (previewSize != null) {
-                        // AI-MOD-START
-                        // 修正：我们必须反转宽高比以适应竖屏显示
-//                        val aspectRatio = previewSize!!.height.toFloat() / previewSize!!.width.toFloat()
-                        val aspectRatio = 0.75f // 经典的 4:3 比例 (3 / 4 = 0.75)
-                        // AI-MOD-END
-                        Log.d("NeuroCam/CameraPreview", "Applying INVERTED aspect ratio: $aspectRatio")
-                        it
-                            .fillMaxWidth()
-                            .aspectRatio(aspectRatio)
-                    } else {
-                        it
-                    }
-                }
-        )
+                // AI-MOD-END
 
-        if (previewSize == null) {
-            CircularProgressIndicator()
-            Text(
-                "Initializing camera...",
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(top = 64.dp)
-            )
-        }
-    }
+                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+                try {
+                    cameraProvider.unbindAll()
+
+                    cameraProvider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        preview
+                    )
+                } catch (exc: Exception) {
+                    Log.e("NeuroCam/CameraPreview", "用例绑定失败", exc)
+                }
+            }, ContextCompat.getMainExecutor(ctx))
+
+            previewView
+        },
+        modifier = modifier.fillMaxSize()
+    )
 }
+
 
 
 @Composable

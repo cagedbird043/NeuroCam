@@ -56,9 +56,7 @@ android {
         compose = true
     }
 }
-
 dependencies {
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
@@ -67,6 +65,19 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+
+    // AI-MOD-START
+    // 添加 CameraX 依赖
+    // camera-core: 核心 API
+    // camera-camera2: Camera2 实现，CameraX 构建于其上
+    // camera-lifecycle: 将相机生命周期与 LifecycleOwner 绑定
+    // camera-view: 提供 PreviewView 控件
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+    // AI-MOD-END
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
@@ -78,7 +89,6 @@ dependencies {
 
 
 
-// --- 在 packages/android_sender/app/build.gradle.kts 文件末尾添加 ---
 
 // 注册一个名为 cargoBuild 的自定义任务，类型为 Exec (执行外部命令)
 tasks.register<Exec>("cargoBuild") {
