@@ -1,5 +1,3 @@
-// --- packages/android_sender/app/src/main/kotlin/com/neurocam/CameraHelper.kt ---
-
 package com.neurocam
 
 import android.annotation.SuppressLint
@@ -11,7 +9,13 @@ import android.hardware.camera2.CameraManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.util.Size
+import android.view.Display // 确保这个 import 存在
 import android.view.Surface
+import android.view.SurfaceHolder
+import android.graphics.SurfaceTexture
+import java.util.Collections
+import kotlin.math.abs
 
 class CameraHelper(private val context: Context, private val listener: Listener? = null) {
 
@@ -21,6 +25,13 @@ class CameraHelper(private val context: Context, private val listener: Listener?
     interface Listener {
         fun onCameraStarted()
         fun onCameraError(error: String)
+        // AI-MOD-START
+        /**
+         * 当选择了最佳预览尺寸后回调
+         * @param size 选定的预览尺寸
+         */
+        fun onPreviewSizeSelected(size: Size)
+        // AI-MOD-END
     }
 
     companion object {
@@ -55,11 +66,54 @@ class CameraHelper(private val context: Context, private val listener: Listener?
             val cameraId = findBackFacingCamera()
                 ?: throw IllegalStateException("No back-facing camera found.")
             Log.i(TAG, "Found back-facing camera with ID: $cameraId")
+
+            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val streamConfigurationMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?: throw IllegalStateException("Cannot get stream configuration map.")
+
+            // AI-MOD-START
+            // 修正：现在我们使用 TextureView，查询尺寸时应该针对 SurfaceTexture
+            val supportedSizes = streamConfigurationMap.getOutputSizes(SurfaceTexture::class.java)
+            if (supportedSizes.isNullOrEmpty()) {
+                throw IllegalStateException("No supported preview sizes found for SurfaceTexture.")
+            }
+
+            // 从支持的尺寸中选择一个最佳尺寸
+            val previewSize = chooseOptimalSize(supportedSizes)
+            // AI-MOD-END
+            Log.i(TAG, "Optimal preview size selected: ${previewSize.width}x${previewSize.height}")
+
+            // 通过回调通知UI
+            listener?.onPreviewSizeSelected(previewSize)
+
             cameraManager.openCamera(cameraId, deviceStateCallback, cameraHandler)
         } catch (e: Exception) {
             val errorMsg = "Failed to initiate camera opening: ${e.message}"
             Log.e(TAG, errorMsg, e)
             listener?.onCameraError(errorMsg)
+        }
+    }
+
+
+    /**
+     * 【修正版 V3】选择一个合适的视频预览尺寸。
+     * 策略：在所有不超过 1080p 的尺寸中，选择面积最大的那个。
+     */
+    private fun chooseOptimalSize(supportedSizes: Array<Size>): Size {
+        val maxPreviewWidth = 1920
+        val maxPreviewHeight = 1080
+
+        val suitableSizes = supportedSizes.filter {
+            it.width <= maxPreviewWidth && it.height <= maxPreviewHeight
+        }
+
+        return if (suitableSizes.isNotEmpty()) {
+            Collections.max(suitableSizes) { a, b ->
+                (a.width.toLong() * a.height).compareTo(b.width.toLong() * b.height)
+            }
+        } else {
+            // 如果没有小于1080p的，就退回到选择面积最小的
+            supportedSizes.minByOrNull { it.width.toLong() * it.height } ?: supportedSizes.first()
         }
     }
 
