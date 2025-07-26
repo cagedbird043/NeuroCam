@@ -1,23 +1,12 @@
 # --- packages/android_sender/.cargo/config.toml ---
 
-# 这个文件告诉 Cargo 和 rust-analyzer，在处理 android_sender 这个 crate 时，
-# 应该始终以 Android 作为目标平台来检查和编译代码。
-# 这解决了 "ndk-sys only supports compiling for Android" 的错误，
-# 并且不会影响到同级目录下的 linux_receiver crate。
-
-# 我们选择一个默认的 Android 目标平台。aarch64 是目前最常见的 64 位 ARM 架构。
 [build]
 target = "aarch64-linux-android"
 
-# 我们需要为这个目标平台显式指定链接器 (linker) 和归档器 (archiver)，
-# 这样 rust-analyzer 才能找到它们。
 [target.aarch64-linux-android]
-# linker 的路径。我们使用 ANDROID_NDK_HOME 环境变量来定位它。
-# '26' 是 API Level，对于我们的 minSdk(26) 来说是合适的。
 linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
 ar = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-ar"
 
-# 同时，为 32 位 ARM 目标也进行配置
 [target.armv7-linux-androideabi]
 linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi26-clang"
 ar = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/arm-linux-androideabi-ar"

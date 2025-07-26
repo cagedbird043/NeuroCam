@@ -1,13 +1,16 @@
-// --- packages/android_sender/settings.gradle.kts ---
-
 pluginManagement {
     repositories {
-        google()
+        google {
+            content {
+                includeGroupByRegex("com\\.android.*")
+                includeGroupByRegex("com\\.google.*")
+                includeGroupByRegex("androidx.*")
+            }
+        }
         mavenCentral()
         gradlePluginPortal()
     }
 }
-
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
@@ -16,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "neurocam_sender"
+rootProject.name = "NeuroCam Sender"
 include(":app")

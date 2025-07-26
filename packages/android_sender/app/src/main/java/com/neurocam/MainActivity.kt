@@ -1,33 +1,47 @@
 package com.neurocam
 
-import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
-import android.widget.TextView
-import com.neurocam.databinding.ActivityMainBinding
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.tooling.preview.Preview
+import com.neurocam.ui.theme.NeuroCamSenderTheme
 
-class MainActivity : AppCompatActivity() {
-
-private lateinit var binding: ActivityMainBinding
-
+class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-     binding = ActivityMainBinding.inflate(layoutInflater)
-     setContentView(binding.root)
-
-        // Example of a call to a native method
-        binding.sampleText.text = stringFromJNI()
+        enableEdgeToEdge()
+        setContent {
+            NeuroCamSenderTheme {
+                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                    Greeting(
+                        name = "Android",
+                        modifier = Modifier.padding(innerPadding)
+                    )
+                }
+            }
+        }
     }
-    /**
-      * A native method that is implemented by the 'neurocam' native library,
-      * which is packaged with this application.
-      */
-     external fun stringFromJNI(): String
+}
 
-     companion object {
-         // Used to load the 'neurocam' library on application startup.
-         init {
-             System.loadLibrary("neurocam")
-         }
-     }
+@Composable
+fun Greeting(name: String, modifier: Modifier = Modifier) {
+    Text(
+        text = "Hello $name!",
+        modifier = modifier
+    )
+}
+
+@Preview(showBackground = true)
+@Composable
+fun GreetingPreview() {
+    NeuroCamSenderTheme {
+        Greeting("Android")
+    }
 }

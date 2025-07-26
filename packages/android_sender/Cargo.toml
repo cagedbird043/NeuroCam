@@ -6,8 +6,9 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
+# 声明这是一个动态库，供 JNI 调用
 crate-type = ["cdylib"]
 
 [dependencies]
-# 我们唯一需要的依赖就是 jni
+# 我们与 Kotlin/Java 交互的唯一桥梁
 jni = "0.21.1"
