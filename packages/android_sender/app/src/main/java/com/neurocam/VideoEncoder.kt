@@ -1,4 +1,4 @@
-// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt (REVISED AND ROBUST FIX) ---
+// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt ---
 package com.neurocam
 
 import android.media.MediaCodec
@@ -7,8 +7,10 @@ import android.media.MediaFormat
 import android.os.Bundle
 import android.util.Log
 import androidx.camera.core.ImageProxy
-import java.nio.ByteBuffer
 
+/**
+ * 封装了 MediaCodec API，用于将来自 CameraX 的 ImageProxy (YUV_420_888) 编码为 H.264 视频流。
+ */
 class VideoEncoder(
     private val width: Int,
     private val height: Int,
@@ -24,10 +26,11 @@ class VideoEncoder(
     private var mediaCodec: MediaCodec? = null
     private var isRunning = false
 
-    // AI-MOD-START: 新增一个变量来缓存 SPS/PPS 配置数据
-    private var csdBuffer: ByteArray? = null
-    // AI-MOD-END
-
+    // AI-MOD-START
+    /**
+     *  请求编码器立即生成一个关键帧 (I-frame)。
+     *  这是一个异步请求，编码器将在下一个可用的时机生成I-frame。
+     */
     fun requestKeyFrame() {
         if (!isRunning || mediaCodec == null) {
             Log.w(TAG, "Cannot request key frame, encoder is not running.")
@@ -42,6 +45,7 @@ class VideoEncoder(
             Log.e(TAG, "Failed to request key frame", e)
         }
     }
+    // AI-MOD-END
 
     fun start() {
         if (isRunning) {
@@ -54,12 +58,6 @@ class VideoEncoder(
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-
-                // 我们不再完全依赖这个标志，但保留它也无妨
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                    setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
-                }
             }
             mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -82,7 +80,6 @@ class VideoEncoder(
         } finally {
             mediaCodec = null
             isRunning = false
-            csdBuffer = null // 清理缓存
             Log.i(TAG, "VideoEncoder stopped.")
         }
     }
@@ -93,16 +90,18 @@ class VideoEncoder(
 
         try {
             val nv21Data = imageProxy.toNv21ByteArray()
+
             val inputBufferIndex = codec.dequeueInputBuffer(10000)
             if (inputBufferIndex >= 0) {
                 val inputBuffer = codec.getInputBuffer(inputBufferIndex)!!
                 inputBuffer.clear()
                 inputBuffer.put(nv21Data)
+                // 这里的 presentationTimeUs 仍然使用 ImageProxy 的时间戳，以保证帧的顺序
                 codec.queueInputBuffer(
                     inputBufferIndex,
                     0,
                     nv21Data.size,
-                    imageProxy.imageInfo.timestamp * 1000, // 注意这里是微秒
+                    imageProxy.imageInfo.timestamp / 1000, // 将纳秒转换为微秒给 MediaCodec
                     0
                 )
             }
@@ -111,52 +110,28 @@ class VideoEncoder(
             while (true) {
                 val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
                 when {
-                    // AI-MOD-START: 捕获 CODEC_CONFIG buffer
-                    outputBufferIndex >= 0 && (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 -> {
-                        val outputBuffer = codec.getOutputBuffer(outputBufferIndex)!!
-                        val csd = ByteArray(bufferInfo.size)
-                        outputBuffer.get(csd)
-                        csdBuffer = csd // 缓存 SPS/PPS
-                        Log.i(TAG, "Captured SPS/PPS (Codec-Config) data. Size: ${csd.size}")
-                        codec.releaseOutputBuffer(outputBufferIndex, false)
-                    }
-                    // AI-MOD-END
-
                     outputBufferIndex >= 0 -> {
                         val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                         if (outputBuffer != null && bufferInfo.size > 0) {
                             val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+                            // AI-MOD-START
+                            // 核心修复：不再使用 bufferInfo 的时间戳，因为它基于单调时钟。
+                            // 我们在即将发送数据时，获取当前的“墙上时钟”时间（基于Unix纪元），
+                            // 这样就能与 Linux 端的时钟进行有意义的比较。
                             val timestampNs = System.currentTimeMillis() * 1_000_000
-
-                            // AI-MOD-START: 核心修复逻辑
-                            // 如果是关键帧，并且我们已经缓存了SPS/PPS，则将它们拼接在一起发送
-                            if (isKeyFrame && csdBuffer != null) {
-                                Log.d(TAG, "Prepending SPS/PPS to a keyframe.")
-                                val frameData = ByteArray(bufferInfo.size)
-                                outputBuffer.get(frameData)
-
-                                val combinedBuffer = csdBuffer!! + frameData
-                                val directBuffer = ByteBuffer.allocateDirect(combinedBuffer.size)
-                                directBuffer.put(combinedBuffer)
-                                directBuffer.flip()
-
-                                NativeBridge.sendVideoFrame(directBuffer, directBuffer.remaining(), isKeyFrame, timestampNs)
-                            } else {
-                                // 对于非关键帧，或者在SPS/PPS还没收到时的第一个关键帧，直接发送
-                                NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame, timestampNs)
-                            }
+                            NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame, timestampNs)
                             // AI-MOD-END
                         }
                         codec.releaseOutputBuffer(outputBufferIndex, false)
                     }
-
                     outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Log.i(TAG, "Output format changed: ${codec.outputFormat}")
                     outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
                     else -> break
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Encoding error", e)
+            Log.e(TAG, "Encoding error (Final Fix)", e)
         }
     }
 }
