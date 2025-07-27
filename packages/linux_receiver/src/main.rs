@@ -1,4 +1,4 @@
-// --- packages/linux_receiver/src/main.rs (THE ABSOLUTE FORMAT LOCK-IN FIX) ---
+// --- packages/linux_receiver/src/main.rs (FINAL AND CORRECT FIX) ---
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -18,54 +18,49 @@ const SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 const VIDEO_WIDTH: i32 = 640;
 const VIDEO_HEIGHT: i32 = 480;
-// ================== THE MOST CRITICAL CHANGE IN THE ENTIRE PROJECT ==================
-// Define ONE SINGLE, UNAMBIGUOUS, rock-solid format that BOTH pipelines will be forced to use.
-// YUY2 is a very common and well-supported V4L2 format.
-const V4L2_FORMAT: &str = "YUY2";
-// ====================================================================================
 
-/// Creates the caps that will be enforced right before the v4l2sink.
-fn create_final_caps() -> gst::Caps {
-    gst::Caps::builder("video/x-raw")
-        .field("width", VIDEO_WIDTH)
-        .field("height", VIDEO_HEIGHT)
-        .field("format", V4L2_FORMAT)
-        .build()
-}
-
-/// 创建待机管线，强制输出最终格式。
+/// 创建一个简单的、只显示待机画面的管线。
+/// 这个管线现在内部也用 x264enc，以模拟一个 H.264 源，确保两个管线更加相似。
 fn create_standby_pipeline() -> Result<gst::Pipeline, Box<dyn Error>> {
     let pipeline = gst::Pipeline::new();
     let src = gst::ElementFactory::make("videotestsrc")
         .name("src")
         .build()?;
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .name("caps")
+        .build()?;
+    let enc = gst::ElementFactory::make("x264enc").name("enc").build()?;
+    let parse = gst::ElementFactory::make("h264parse")
+        .name("parse")
+        .build()?;
+    let decode = gst::ElementFactory::make("avdec_h264")
+        .name("decode")
+        .build()?;
     let convert = gst::ElementFactory::make("videoconvert")
         .name("convert")
         .build()?;
-    let capsfilter = gst::ElementFactory::make("capsfilter")
-        .name("capsfilter")
-        .build()?;
     let sink = gst::ElementFactory::make("v4l2sink").name("sink").build()?;
 
-    capsfilter.set_property("caps", &create_final_caps());
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("width", VIDEO_WIDTH)
+        .field("height", VIDEO_HEIGHT)
+        .build();
+    capsfilter.set_property("caps", &caps);
 
     src.set_property_from_str("is-live", "true");
     src.set_property_from_str("pattern", "smpte");
+    enc.set_property_from_str("tune", "zerolatency"); // For live sources
     sink.set_property("device", V4L2_DEVICE);
     sink.set_property_from_str("sync", "false");
 
-    pipeline.add_many(&[&src, &convert, &capsfilter, &sink])?;
-    // The order is crucial: src -> convert (does the work) -> capsfilter (enforces) -> sink
-    gst::Element::link_many(&[&src, &convert, &capsfilter, &sink])?;
+    pipeline.add_many(&[&src, &capsfilter, &enc, &parse, &decode, &convert, &sink])?;
+    gst::Element::link_many(&[&src, &capsfilter, &enc, &parse, &decode, &convert, &sink])?;
 
-    println!(
-        "[GStreamer] Standby pipeline created, enforcing {} format.",
-        V4L2_FORMAT
-    );
+    println!("[GStreamer] Standby pipeline created.");
     Ok(pipeline)
 }
 
-/// 创建网络管线，同样强制输出最终格式。
+/// 创建一个简单的、只处理网络视频流的管线。
 fn create_network_pipeline() -> Result<(gst::Pipeline, gst_app::AppSrc), Box<dyn Error>> {
     let pipeline = gst::Pipeline::new();
     let appsrc_element = gst::ElementFactory::make("appsrc").name("appsrc").build()?;
@@ -78,12 +73,7 @@ fn create_network_pipeline() -> Result<(gst::Pipeline, gst_app::AppSrc), Box<dyn
     let convert = gst::ElementFactory::make("videoconvert")
         .name("convert")
         .build()?;
-    let capsfilter = gst::ElementFactory::make("capsfilter")
-        .name("capsfilter")
-        .build()?;
     let sink = gst::ElementFactory::make("v4l2sink").name("sink").build()?;
-
-    capsfilter.set_property("caps", &create_final_caps());
 
     let appsrc = appsrc_element.downcast_ref::<gst_app::AppSrc>().unwrap();
     appsrc.set_property_from_str(
@@ -94,36 +84,22 @@ fn create_network_pipeline() -> Result<(gst::Pipeline, gst_app::AppSrc), Box<dyn
     appsrc.set_property_from_str("do-timestamp", "false");
     appsrc.set_format(gst::Format::Time);
 
-    parse.set_property_from_str("config-interval", "-1");
+    // This property is important. By default, h264parse might only send caps
+    // once. Setting it to -1 tells it to re-negotiate whenever it sees
+    // a new SPS/PPS, which our Android app now sends with every I-Frame.
+    parse.set_property("config-interval", -1i32);
+
     sink.set_property("device", V4L2_DEVICE);
     sink.set_property_from_str("sync", "false");
 
-    pipeline.add_many(&[
-        &appsrc_element,
-        &parse,
-        &decode,
-        &convert,
-        &capsfilter,
-        &sink,
-    ])?;
-    // The order is crucial and IDENTICAL to the standby pipeline's tail.
-    gst::Element::link_many(&[
-        &appsrc_element,
-        &parse,
-        &decode,
-        &convert,
-        &capsfilter,
-        &sink,
-    ])?;
+    pipeline.add_many(&[&appsrc_element, &parse, &decode, &convert, &sink])?;
+    gst::Element::link_many(&[&appsrc_element, &parse, &decode, &convert, &sink])?;
 
-    println!(
-        "[GStreamer] Network pipeline created, enforcing {} format.",
-        V4L2_FORMAT
-    );
+    println!("[GStreamer] Network pipeline created. Ready for self-describing I-Frames.");
     Ok((pipeline, appsrc.clone()))
 }
 
-// The AppState and main loop logic is correct. No changes needed below.
+// The AppState and main loop logic is correct and robust. No changes needed.
 enum AppState {
     Standby {
         pipeline: gst::Pipeline,
@@ -192,35 +168,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 pipeline: _,
                 appsrc,
                 stream_start_time,
-            } => {
-                match tokio::time::timeout(SIGNAL_TIMEOUT, socket.recv_from(&mut buf)).await {
-                    Ok(Ok((len, remote_addr))) => {
-                        if let Some(
-                            PacketOutcome::FrameProcessed(frame_data)
-                            | PacketOutcome::IFrameReceived(frame_data),
-                        ) =
-                            handle_udp_packet(len, &buf, &remote_addr, &mut reassemblers, &socket)
-                                .await
-                        {
-                            let running_time = std::time::Instant::now()
-                                .saturating_duration_since(*stream_start_time);
-                            push_frame_to_appsrc(appsrc, frame_data, running_time);
-                        }
+            } => match tokio::time::timeout(SIGNAL_TIMEOUT, socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, remote_addr))) => {
+                    if let Some(
+                        PacketOutcome::FrameProcessed(frame_data)
+                        | PacketOutcome::IFrameReceived(frame_data),
+                    ) =
+                        handle_udp_packet(len, &buf, &remote_addr, &mut reassemblers, &socket).await
+                    {
+                        let running_time =
+                            std::time::Instant::now().saturating_duration_since(*stream_start_time);
+                        push_frame_to_appsrc(appsrc, frame_data, running_time);
                     }
-                    Err(_) => {
-                        println!("[State] Signal lost. Switching back to Standby state...");
-                        state.stop();
-                        let standby_pipeline = create_standby_pipeline()?;
-                        standby_pipeline.set_state(gst::State::Playing)?;
-                        state = AppState::Standby {
-                            pipeline: standby_pipeline,
-                        };
-                        // Clear the reassembler state to be ready for the next connection
-                        reassemblers.clear();
-                    }
-                    _ => {}
                 }
-            }
+                Err(_) => {
+                    println!("[State] Signal lost. Switching back to Standby state...");
+                    state.stop();
+                    let standby_pipeline = create_standby_pipeline()?;
+                    standby_pipeline.set_state(gst::State::Playing)?;
+                    state = AppState::Standby {
+                        pipeline: standby_pipeline,
+                    };
+                    reassemblers.clear();
+                }
+                _ => {}
+            },
         }
     }
 }

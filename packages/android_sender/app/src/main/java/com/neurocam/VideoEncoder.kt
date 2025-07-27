@@ -1,4 +1,4 @@
-// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt (THE DEFINITIVE FIX) ---
+// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt (FINAL AND CORRECT FIX) ---
 package com.neurocam
 
 import android.media.MediaCodec
@@ -50,17 +50,19 @@ class VideoEncoder(
                 setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
 
-                // ================== THE MOST IMPORTANT FIX OF THE ENTIRE PROJECT ==================
-                // We MUST force the encoder to use the same profile that the receiver expects.
-                // The receiver is hardcoded to expect "baseline" profile for maximum compatibility.
+                // The GStreamer receiver expects a baseline profile for max compatibility.
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-                Log.i(TAG, "H.264 profile forced to aac_profile_baseline.")
-                // ===================================================================================
 
+                // ================== THIS IS THE CRITICAL FIX ==================
+                // This key, available on API 29+, forces the encoder to prepend
+                // the SPS/PPS header to every I-Frame (sync frame).
+                // This ensures the GStreamer decoder can start decoding from any I-Frame
+                // without needing prior context. It's the key to robust stream switching.
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                     setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
-                    Log.i(TAG, "SPS/PPS prepending to I-frames is enabled.")
+                    Log.i(TAG, "SPS/PPS prepending to I-frames is enabled. This is good.")
                 }
+                // =============================================================
             }
             mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
