@@ -1,4 +1,4 @@
-// --- packages/linux_receiver/src/main.rs (CORRECTED VERSION) ---
+// --- packages/linux_receiver/src/main.rs (THE ULTIMATE AND FINAL VERSION) ---
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -16,7 +16,6 @@ const V4L2_DEVICE: &str = "/dev/video10";
 const MAX_DATAGRAM_SIZE: usize = 65_507;
 const SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-// 和安卓端匹配的视频分辨率
 const VIDEO_WIDTH: i32 = 640;
 const VIDEO_HEIGHT: i32 = 480;
 
@@ -26,23 +25,34 @@ struct FinalPipeline {
     selector: gst::Element,
 }
 
-/// 创建最终的、解耦的、工业级稳定的管线 (根据最终诊断进行修复)
-/// 黄金法则: 总是在未压缩的原始视频域进行流切换
+/// 创建最终的、解耦的、工业级稳定的管线
+/// 法则 1: 在 raw video 域进行切换
+/// 法则 2: 用 queue 解耦输入分支
+/// 法则 3 (最终法则): 用 leaky queue 防止 sink 阻塞整个管线
 fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     gst::init()?;
     let pipeline = gst::Pipeline::new();
 
     // --- 1. 创建所有 GStreamer 元素 ---
 
-    // 分支 1: 待机画面 (直接生成 raw video)
+    let raw_video_caps = gst::Caps::builder("video/x-raw")
+        .field("width", VIDEO_WIDTH)
+        .field("height", VIDEO_HEIGHT)
+        .field("format", "I420")
+        .build();
+
+    // 分支 1: 待机画面
     let standby_src = gst::ElementFactory::make("videotestsrc")
         .name("standby_src")
         .build()?;
     let standby_caps = gst::ElementFactory::make("capsfilter")
-        .name("standby_caps_filter")
+        .name("standby_caps")
+        .build()?;
+    let standby_queue = gst::ElementFactory::make("queue")
+        .name("standby_queue")
         .build()?;
 
-    // 分支 2: 网络视频流 (解码成 raw video)
+    // 分支 2: 网络视频流
     let appsrc_element = gst::ElementFactory::make("appsrc").name("appsrc").build()?;
     let net_parse = gst::ElementFactory::make("h264parse")
         .name("net_parser")
@@ -51,10 +61,13 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         .name("net_decoder")
         .build()?;
     let net_convert = gst::ElementFactory::make("videoconvert")
-        .name("net_videoconvert")
+        .name("net_convert")
         .build()?;
     let net_caps = gst::ElementFactory::make("capsfilter")
-        .name("net_caps_filter")
+        .name("net_caps")
+        .build()?;
+    let net_queue = gst::ElementFactory::make("queue")
+        .name("net_queue")
         .build()?;
 
     // 切换点
@@ -63,91 +76,86 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         .build()?;
 
     // 公共尾部
-    let common_queue = gst::ElementFactory::make("queue")
-        .name("common_queue")
+    let final_convert = gst::ElementFactory::make("videoconvert")
+        .name("final_convert")
         .build()?;
-    let common_convert = gst::ElementFactory::make("videoconvert")
-        .name("common_videoconvert")
-        .build()?;
+    let sink_queue = gst::ElementFactory::make("queue")
+        .name("sink_queue")
+        .build()?; // <-- 关键修复
     let sink = gst::ElementFactory::make("v4l2sink")
         .name("v4l2_sink")
         .build()?;
 
     // --- 2. 配置元素属性 ---
 
-    // 定义一个统一的、未压缩的视频格式，这是稳定切换的关键
-    let raw_video_caps = gst::Caps::builder("video/x-raw")
-        .field("width", VIDEO_WIDTH)
-        .field("height", VIDEO_HEIGHT)
-        // 使用一个 v4l2sink 和 videoconvert 通常都支持的格式
-        .field("format", "I420")
-        .build();
-
-    // 配置待机分支
     standby_src.set_property("is-live", true);
-    standby_src.set_property_from_str("pattern", "smpte"); // 彩虹条纹测试图
+    standby_src.set_property_from_str("pattern", "smpte");
     standby_caps.set_property("caps", &raw_video_caps);
 
-    // 配置网络分支
     let appsrc = appsrc_element.downcast_ref::<gst_app::AppSrc>().unwrap();
     appsrc.set_property_from_str(
         "caps",
-        // appsrc 仍然接收 H264 码流
         "video/x-h264, stream-format=byte-stream, alignment=au, profile=baseline",
     );
     appsrc.set_property("is-live", true);
-    appsrc.set_property("do-timestamp", false); // 我们手动设置时间戳
+    appsrc.set_property("do-timestamp", false);
     appsrc.set_format(gst::Format::Time);
     net_parse.set_property("config-interval", -1);
-    net_caps.set_property("caps", &raw_video_caps); // 强制解码后的流符合统一格式
+    net_caps.set_property("caps", &raw_video_caps);
 
-    // 配置公共尾部
+    // ================== CRITICAL FIX ==================
+    // 这个 queue 防止 v4l2sink 在没有客户端（如 ffplay）读取时阻塞整个管线。
+    // leaky=2 (downstream): 如果下游阻塞，则丢弃队列中最旧的缓冲区。
+    sink_queue.set_property_from_str("leaky", "downstream");
+    // 我们只关心最新的帧，所以一个很小的缓冲区就足够了。
+    sink_queue.set_property("max-size-buffers", 2u32);
+    // ================================================
+
     sink.set_property("device", V4L2_DEVICE);
-    sink.set_property("sync", false); // 对实时流非常重要
+    sink.set_property("sync", false);
 
-    // --- 3. 将所有元素添加到管线 ---
+    // --- 3. 添加到管线 ---
     pipeline.add_many(&[
         &standby_src,
         &standby_caps,
+        &standby_queue,
         &appsrc_element,
         &net_parse,
         &net_decode,
         &net_convert,
         &net_caps,
+        &net_queue,
         &selector,
-        &common_queue,
-        &common_convert,
+        &final_convert,
+        &sink_queue,
         &sink,
     ])?;
 
-    // --- 4. 链接管线元素 ---
-
-    // 链接待机分支到 selector.sink_0
-    gst::Element::link_many(&[&standby_src, &standby_caps])?;
-    let standby_pad = standby_caps.static_pad("src").unwrap();
+    // --- 4. 链接元素 ---
+    gst::Element::link_many(&[&standby_src, &standby_caps, &standby_queue])?;
+    let standby_pad = standby_queue.static_pad("src").unwrap();
     let selector_sink_0 = selector.request_pad_simple("sink_0").unwrap();
     standby_pad.link(&selector_sink_0)?;
 
-    // 链接网络分支到 selector.sink_1
     gst::Element::link_many(&[
         &appsrc_element,
         &net_parse,
         &net_decode,
         &net_convert,
         &net_caps,
+        &net_queue,
     ])?;
-    let net_pad = net_caps.static_pad("src").unwrap();
+    let net_pad = net_queue.static_pad("src").unwrap();
     let selector_sink_1 = selector.request_pad_simple("sink_1").unwrap();
     net_pad.link(&selector_sink_1)?;
 
-    // 链接公共尾部
-    gst::Element::link_many(&[&selector, &common_queue, &common_convert, &sink])?;
+    // 链接公共尾部，包含我们的关键修复
+    gst::Element::link_many(&[&selector, &final_convert, &sink_queue, &sink])?;
 
     // --- 5. 设置初始状态 ---
-    // 初始激活待机画面的输入端口 (sink_0)
     selector.set_property("active-pad", &selector_sink_0);
 
-    println!("[GStreamer] Robust pipeline created. Switching will happen in the raw video domain.");
+    println!("[GStreamer] The truly final, robust pipeline is created. Sink is non-blocking.");
     Ok(FinalPipeline {
         pipeline,
         appsrc: appsrc.clone(),
@@ -156,8 +164,7 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
 }
 
 // =========================================================================================
-//  main() 和其他辅助函数无需任何修改，它们已经写得很好了。
-//  下面的代码保持原样。
+//  main() 和其他辅助函数无需任何修改。
 // =========================================================================================
 
 #[derive(Debug, PartialEq, Eq)]
@@ -217,7 +224,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if signal_active && last_packet_time.elapsed() > SIGNAL_TIMEOUT {
                     println!("[STATE] Signal Lost! Switching back to Standby Stream...");
 
-                    // 你的超时恢复逻辑是正确的，这里保留
                     pipeline.set_state(gst::State::Paused)?;
                     selector.set_property("active-pad", &standby_pad);
                     pipeline.set_state(gst::State::Playing)?;
