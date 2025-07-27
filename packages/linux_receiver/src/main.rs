@@ -29,7 +29,7 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     let pipeline = gst::Pipeline::new();
 
     // 1. 创建所有元素
-    // -- 待机分支 (使用永不终结的实时源) --
+    // -- 待机分支 --
     let standby_src = gst::ElementFactory::make("videotestsrc")
         .name("standby_src")
         .build()?;
@@ -39,13 +39,22 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     let standby_convert = gst::ElementFactory::make("videoconvert")
         .name("standby_convert")
         .build()?;
-    // 使用正确的编码器名称：avenc_h264
     let standby_enc = gst::ElementFactory::make("x264enc")
         .name("standby_encoder")
         .build()?;
+    // ================== 核心修正：为待机分支添加队列 ==================
+    let standby_queue = gst::ElementFactory::make("queue")
+        .name("standby_queue")
+        .build()?;
+    // ================================================================
 
     // -- 网络分支 --
     let appsrc_element = gst::ElementFactory::make("appsrc").name("appsrc").build()?;
+    // ================== 核心修正：为网络分支添加队列 ==================
+    let net_queue = gst::ElementFactory::make("queue")
+        .name("net_queue")
+        .build()?;
+    // ================================================================
 
     // -- 切换器 --
     let selector = gst::ElementFactory::make("input-selector")
@@ -65,18 +74,15 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     let sink = gst::ElementFactory::make("v4l2sink").name("sink").build()?;
 
     // 2. 配置元素
-    standby_src.set_property("is-live", true);
-    // 使用你认可的、正确的 set_property_from_str 方法
-    standby_src.set_property_from_str("pattern", "smpte"); // 0 = smpte 彩虹条
+    standby_src.set_property_from_str("is-live", "true");
+    standby_src.set_property_from_str("pattern", "smpte");
 
-    // FINAL FIX 1: 为待机画面强制设定正确的分辨率，解决"小窗口"问题
     let raw_video_caps = gst::Caps::builder("video/x-raw")
         .field("width", 640)
         .field("height", 480)
         .build();
     standby_caps.set_property("caps", &raw_video_caps);
 
-    // 使用 tune="zerolatency" 进行低延迟实时编码
     standby_enc.set_property_from_str("tune", "zerolatency");
 
     let appsrc = appsrc_element.downcast_ref::<gst_app::AppSrc>().unwrap();
@@ -88,11 +94,10 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     appsrc.set_property("do-timestamp", true);
     appsrc.set_format(gst::Format::Time);
 
-    // FINAL FIX 2: 强制 h264parse 在每个I帧前都附加上配置信息，解决"冷启动"灰屏问题
     parse.set_property("config-interval", -1);
 
     sink.set_property("device", V4L2_DEVICE);
-    sink.set_property("sync", false);
+    sink.set_property_from_str("sync", "false");
 
     // 3. 添加所有元素到管线
     pipeline.add_many(&[
@@ -100,7 +105,9 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         &standby_caps,
         &standby_convert,
         &standby_enc,
+        &standby_queue,
         &appsrc_element,
+        &net_queue,
         &selector,
         &parse,
         &decode,
@@ -109,16 +116,23 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     ])?;
 
     // 4. 链接管线
-    // -- 链接待机分支 (包含分辨率过滤器) --
-    gst::Element::link_many(&[&standby_src, &standby_caps, &standby_convert, &standby_enc])?;
-    let standby_enc_pad = standby_enc.static_pad("src").unwrap();
+    // -- 链接待机分支，经由队列，到 selector --
+    gst::Element::link_many(&[
+        &standby_src,
+        &standby_caps,
+        &standby_convert,
+        &standby_enc,
+        &standby_queue,
+    ])?;
+    let standby_queue_pad = standby_queue.static_pad("src").unwrap();
     let selector_sink_0 = selector.request_pad_simple("sink_0").unwrap();
-    standby_enc_pad.link(&selector_sink_0)?;
+    standby_queue_pad.link(&selector_sink_0)?;
 
-    // -- 链接网络分支 --
-    let appsrc_pad = appsrc_element.static_pad("src").unwrap();
+    // -- 链接网络分支，经由队列，到 selector --
+    gst::Element::link_many(&[&appsrc_element, &net_queue])?;
+    let net_queue_pad = net_queue.static_pad("src").unwrap();
     let selector_sink_1 = selector.request_pad_simple("sink_1").unwrap();
-    appsrc_pad.link(&selector_sink_1)?;
+    net_queue_pad.link(&selector_sink_1)?;
 
     // -- 链接公共处理路径 --
     selector.link(&parse)?;
@@ -127,7 +141,7 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     // 5. 设置初始状态：激活待机分支
     selector.set_property("active-pad", &selector_sink_0);
 
-    println!("[GStreamer] Final, robust pipeline created. All known bugs have been fixed.");
+    println!("[GStreamer] Final, decoupled, industrial-grade pipeline created.");
     Ok(FinalPipeline {
         pipeline,
         appsrc: appsrc.clone(),
