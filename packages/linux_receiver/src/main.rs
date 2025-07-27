@@ -1,4 +1,4 @@
-// --- packages/linux_receiver/src/main.rs (THE DEFINITIVE SOLUTION, IMPLEMENTING YOUR ANALYSIS) ---
+// --- packages/linux_receiver/src/main.rs (THE DEFINITIVE SOLUTION, IMPLEMENTING YOUR FINAL ANALYSIS) ---
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -40,7 +40,6 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     let standby_enc = gst::ElementFactory::make("x264enc")
         .name("standby_encoder")
         .build()?;
-    // 您的修复方案 #2：为待机流强制设定 H.264 Profile
     let standby_h264_caps = gst::ElementFactory::make("capsfilter")
         .name("standby_h264_caps")
         .build()?;
@@ -76,14 +75,12 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     standby_caps.set_property("caps", &raw_video_caps);
 
     standby_enc.set_property_from_str("tune", "zerolatency");
-    // 您的修复方案 #2：定义并应用 Baseline Profile 的 Caps，统一编码标准
     let h264_baseline_caps = gst::Caps::builder("video/x-h264")
         .field("profile", "baseline")
         .build();
     standby_h264_caps.set_property("caps", &h264_baseline_caps);
 
     let appsrc = appsrc_element.downcast_ref::<gst_app::AppSrc>().unwrap();
-    // 您的修复方案 #2：确保 appsrc 也声明自己是 baseline profile
     appsrc.set_property_from_str(
         "caps",
         "video/x-h264, stream-format=byte-stream, alignment=au, profile=baseline",
@@ -200,7 +197,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Timeout
                 if signal_active && last_packet_time.elapsed() > SIGNAL_TIMEOUT {
                     println!("[STATE] Signal Lost! Switching back to Standby Stream...");
-                    // 您的修复方案 #4：切换回待机时，重置管线状态
+                    // 您的修复方案：切换回待机时，重置管线状态以确保健壮性
                     pipeline.set_state(gst::State::Paused)?;
                     selector.set_property("active-pad", &standby_pad);
                     pipeline.set_state(gst::State::Playing)?;
@@ -272,7 +269,7 @@ async fn handle_udp_packet(
         let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
 
         if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
-            // 您的修复方案 #1：在推送 buffer 前加长度检查，防止空帧进入管线
+            // 您的修复方案：在推送 buffer 前加长度检查，杜绝空帧进入管线
             if complete_frame.is_empty() {
                 eprintln!(
                     "[ERROR] Reassembled a zero-length frame for ID {}, skipping push.",
@@ -300,6 +297,7 @@ async fn handle_udp_packet(
             reassemblers.remove(&header.frame_id);
 
             if is_key_frame {
+                println!("[DEBUG] I-Frame received, frame_id={}", header.frame_id);
                 let ack = AckPacket {
                     frame_id: header.frame_id,
                 };

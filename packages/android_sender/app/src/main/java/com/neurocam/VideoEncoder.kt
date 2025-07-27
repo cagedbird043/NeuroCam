@@ -1,4 +1,4 @@
-// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt ---
+// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt (FINAL VERSION) ---
 package com.neurocam
 
 import android.media.MediaCodec
@@ -8,9 +8,6 @@ import android.os.Bundle
 import android.util.Log
 import androidx.camera.core.ImageProxy
 
-/**
- * 封装了 MediaCodec API，用于将来自 CameraX 的 ImageProxy (YUV_420_888) 编码为 H.264 视频流。
- */
 class VideoEncoder(
     private val width: Int,
     private val height: Int,
@@ -26,11 +23,6 @@ class VideoEncoder(
     private var mediaCodec: MediaCodec? = null
     private var isRunning = false
 
-    // AI-MOD-START
-    /**
-     *  请求编码器立即生成一个关键帧 (I-frame)。
-     *  这是一个异步请求，编码器将在下一个可用的时机生成I-frame。
-     */
     fun requestKeyFrame() {
         if (!isRunning || mediaCodec == null) {
             Log.w(TAG, "Cannot request key frame, encoder is not running.")
@@ -45,7 +37,6 @@ class VideoEncoder(
             Log.e(TAG, "Failed to request key frame", e)
         }
     }
-    // AI-MOD-END
 
     fun start() {
         if (isRunning) {
@@ -58,6 +49,14 @@ class VideoEncoder(
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
+
+                // ================== 您的最终修复方案：强制每个I帧都带SPS/PPS ==================
+                // 这个键在API 29+上可用，确保解码器在任何时候都能从I帧开始解码
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
+                    Log.i(TAG, "SPS/PPS prepending to I-frames is enabled.")
+                }
+                // =========================================================================
             }
             mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -96,12 +95,11 @@ class VideoEncoder(
                 val inputBuffer = codec.getInputBuffer(inputBufferIndex)!!
                 inputBuffer.clear()
                 inputBuffer.put(nv21Data)
-                // 这里的 presentationTimeUs 仍然使用 ImageProxy 的时间戳，以保证帧的顺序
                 codec.queueInputBuffer(
                     inputBufferIndex,
                     0,
                     nv21Data.size,
-                    imageProxy.imageInfo.timestamp / 1000, // 将纳秒转换为微秒给 MediaCodec
+                    imageProxy.imageInfo.timestamp / 1000,
                     0
                 )
             }
@@ -114,14 +112,8 @@ class VideoEncoder(
                         val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                         if (outputBuffer != null && bufferInfo.size > 0) {
                             val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-
-                            // AI-MOD-START
-                            // 核心修复：不再使用 bufferInfo 的时间戳，因为它基于单调时钟。
-                            // 我们在即将发送数据时，获取当前的“墙上时钟”时间（基于Unix纪元），
-                            // 这样就能与 Linux 端的时钟进行有意义的比较。
                             val timestampNs = System.currentTimeMillis() * 1_000_000
                             NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame, timestampNs)
-                            // AI-MOD-END
                         }
                         codec.releaseOutputBuffer(outputBufferIndex, false)
                     }
@@ -131,7 +123,7 @@ class VideoEncoder(
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Encoding error (Final Fix)", e)
+            Log.e(TAG, "Encoding error", e)
         }
     }
 }
