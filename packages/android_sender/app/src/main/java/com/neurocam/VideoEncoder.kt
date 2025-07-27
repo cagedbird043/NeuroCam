@@ -1,4 +1,4 @@
-// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt (FINAL AND CORRECT FIX) ---
+// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt (REVISED AND ROBUST FIX) ---
 package com.neurocam
 
 import android.media.MediaCodec
@@ -7,6 +7,7 @@ import android.media.MediaFormat
 import android.os.Bundle
 import android.util.Log
 import androidx.camera.core.ImageProxy
+import java.nio.ByteBuffer
 
 class VideoEncoder(
     private val width: Int,
@@ -22,6 +23,10 @@ class VideoEncoder(
 
     private var mediaCodec: MediaCodec? = null
     private var isRunning = false
+
+    // AI-MOD-START: 新增一个变量来缓存 SPS/PPS 配置数据
+    private var csdBuffer: ByteArray? = null
+    // AI-MOD-END
 
     fun requestKeyFrame() {
         if (!isRunning || mediaCodec == null) {
@@ -49,20 +54,12 @@ class VideoEncoder(
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
-
-                // The GStreamer receiver expects a baseline profile for max compatibility.
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
 
-                // ================== THIS IS THE CRITICAL FIX ==================
-                // This key, available on API 29+, forces the encoder to prepend
-                // the SPS/PPS header to every I-Frame (sync frame).
-                // This ensures the GStreamer decoder can start decoding from any I-Frame
-                // without needing prior context. It's the key to robust stream switching.
+                // 我们不再完全依赖这个标志，但保留它也无妨
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                     setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
-                    Log.i(TAG, "SPS/PPS prepending to I-frames is enabled. This is good.")
                 }
-                // =============================================================
             }
             mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -85,6 +82,7 @@ class VideoEncoder(
         } finally {
             mediaCodec = null
             isRunning = false
+            csdBuffer = null // 清理缓存
             Log.i(TAG, "VideoEncoder stopped.")
         }
     }
@@ -95,7 +93,6 @@ class VideoEncoder(
 
         try {
             val nv21Data = imageProxy.toNv21ByteArray()
-
             val inputBufferIndex = codec.dequeueInputBuffer(10000)
             if (inputBufferIndex >= 0) {
                 val inputBuffer = codec.getInputBuffer(inputBufferIndex)!!
@@ -105,7 +102,7 @@ class VideoEncoder(
                     inputBufferIndex,
                     0,
                     nv21Data.size,
-                    imageProxy.imageInfo.timestamp / 1000,
+                    imageProxy.imageInfo.timestamp * 1000, // 注意这里是微秒
                     0
                 )
             }
@@ -114,15 +111,45 @@ class VideoEncoder(
             while (true) {
                 val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
                 when {
+                    // AI-MOD-START: 捕获 CODEC_CONFIG buffer
+                    outputBufferIndex >= 0 && (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 -> {
+                        val outputBuffer = codec.getOutputBuffer(outputBufferIndex)!!
+                        val csd = ByteArray(bufferInfo.size)
+                        outputBuffer.get(csd)
+                        csdBuffer = csd // 缓存 SPS/PPS
+                        Log.i(TAG, "Captured SPS/PPS (Codec-Config) data. Size: ${csd.size}")
+                        codec.releaseOutputBuffer(outputBufferIndex, false)
+                    }
+                    // AI-MOD-END
+
                     outputBufferIndex >= 0 -> {
                         val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
                         if (outputBuffer != null && bufferInfo.size > 0) {
                             val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                             val timestampNs = System.currentTimeMillis() * 1_000_000
-                            NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame, timestampNs)
+
+                            // AI-MOD-START: 核心修复逻辑
+                            // 如果是关键帧，并且我们已经缓存了SPS/PPS，则将它们拼接在一起发送
+                            if (isKeyFrame && csdBuffer != null) {
+                                Log.d(TAG, "Prepending SPS/PPS to a keyframe.")
+                                val frameData = ByteArray(bufferInfo.size)
+                                outputBuffer.get(frameData)
+
+                                val combinedBuffer = csdBuffer!! + frameData
+                                val directBuffer = ByteBuffer.allocateDirect(combinedBuffer.size)
+                                directBuffer.put(combinedBuffer)
+                                directBuffer.flip()
+
+                                NativeBridge.sendVideoFrame(directBuffer, directBuffer.remaining(), isKeyFrame, timestampNs)
+                            } else {
+                                // 对于非关键帧，或者在SPS/PPS还没收到时的第一个关键帧，直接发送
+                                NativeBridge.sendVideoFrame(outputBuffer, bufferInfo.size, isKeyFrame, timestampNs)
+                            }
+                            // AI-MOD-END
                         }
                         codec.releaseOutputBuffer(outputBufferIndex, false)
                     }
+
                     outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Log.i(TAG, "Output format changed: ${codec.outputFormat}")
                     outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
                     else -> break
