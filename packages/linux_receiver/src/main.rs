@@ -1,4 +1,4 @@
-// --- packages/linux_receiver/src/main.rs (THE DEFINITIVE SOLUTION, IMPLEMENTING YOUR FINAL ANALYSIS) ---
+// --- packages/linux_receiver/src/main.rs (CORRECTED VERSION) ---
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -16,130 +16,149 @@ const V4L2_DEVICE: &str = "/dev/video10";
 const MAX_DATAGRAM_SIZE: usize = 65_507;
 const SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+// 和安卓端匹配的视频分辨率
+const VIDEO_WIDTH: i32 = 640;
+const VIDEO_HEIGHT: i32 = 480;
+
 struct FinalPipeline {
     pipeline: gst::Pipeline,
     appsrc: gst_app::AppSrc,
     selector: gst::Element,
 }
 
-/// 创建最终的、解耦的、工业级稳定的管线 (根据您的最终诊断进行修复)
+/// 创建最终的、解耦的、工业级稳定的管线 (根据最终诊断进行修复)
+/// 黄金法则: 总是在未压缩的原始视频域进行流切换
 fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     gst::init()?;
     let pipeline = gst::Pipeline::new();
 
-    // 1. 创建所有元素
+    // --- 1. 创建所有 GStreamer 元素 ---
+
+    // 分支 1: 待机画面 (直接生成 raw video)
     let standby_src = gst::ElementFactory::make("videotestsrc")
         .name("standby_src")
         .build()?;
     let standby_caps = gst::ElementFactory::make("capsfilter")
-        .name("standby_caps")
-        .build()?;
-    let standby_convert = gst::ElementFactory::make("videoconvert")
-        .name("standby_convert")
-        .build()?;
-    let standby_enc = gst::ElementFactory::make("x264enc")
-        .name("standby_encoder")
-        .build()?;
-    let standby_h264_caps = gst::ElementFactory::make("capsfilter")
-        .name("standby_h264_caps")
+        .name("standby_caps_filter")
         .build()?;
 
+    // 分支 2: 网络视频流 (解码成 raw video)
     let appsrc_element = gst::ElementFactory::make("appsrc").name("appsrc").build()?;
-    let net_queue = gst::ElementFactory::make("queue")
-        .name("net_queue")
+    let net_parse = gst::ElementFactory::make("h264parse")
+        .name("net_parser")
+        .build()?;
+    let net_decode = gst::ElementFactory::make("avdec_h264")
+        .name("net_decoder")
+        .build()?;
+    let net_convert = gst::ElementFactory::make("videoconvert")
+        .name("net_videoconvert")
+        .build()?;
+    let net_caps = gst::ElementFactory::make("capsfilter")
+        .name("net_caps_filter")
         .build()?;
 
+    // 切换点
     let selector = gst::ElementFactory::make("input-selector")
         .name("selector")
         .build()?;
 
-    let parse = gst::ElementFactory::make("h264parse")
-        .name("parser")
-        .build()?;
-    let decode = gst::ElementFactory::make("avdec_h264")
-        .name("decoder")
+    // 公共尾部
+    let common_queue = gst::ElementFactory::make("queue")
+        .name("common_queue")
         .build()?;
     let common_convert = gst::ElementFactory::make("videoconvert")
-        .name("common_convert")
+        .name("common_videoconvert")
         .build()?;
-    let sink = gst::ElementFactory::make("v4l2sink").name("sink").build()?;
+    let sink = gst::ElementFactory::make("v4l2sink")
+        .name("v4l2_sink")
+        .build()?;
 
-    // 2. 配置元素
-    standby_src.set_property_from_str("is-live", "true");
-    standby_src.set_property_from_str("pattern", "smpte");
+    // --- 2. 配置元素属性 ---
 
+    // 定义一个统一的、未压缩的视频格式，这是稳定切换的关键
     let raw_video_caps = gst::Caps::builder("video/x-raw")
-        .field("width", 640)
-        .field("height", 480)
+        .field("width", VIDEO_WIDTH)
+        .field("height", VIDEO_HEIGHT)
+        // 使用一个 v4l2sink 和 videoconvert 通常都支持的格式
+        .field("format", "I420")
         .build();
+
+    // 配置待机分支
+    standby_src.set_property("is-live", true);
+    standby_src.set_property_from_str("pattern", "smpte"); // 彩虹条纹测试图
     standby_caps.set_property("caps", &raw_video_caps);
 
-    standby_enc.set_property_from_str("tune", "zerolatency");
-    let h264_baseline_caps = gst::Caps::builder("video/x-h264")
-        .field("profile", "baseline")
-        .build();
-    standby_h264_caps.set_property("caps", &h264_baseline_caps);
-
+    // 配置网络分支
     let appsrc = appsrc_element.downcast_ref::<gst_app::AppSrc>().unwrap();
     appsrc.set_property_from_str(
         "caps",
+        // appsrc 仍然接收 H264 码流
         "video/x-h264, stream-format=byte-stream, alignment=au, profile=baseline",
     );
-    appsrc.set_property_from_str("is-live", "true");
-    appsrc.set_property_from_str("do-timestamp", "false");
+    appsrc.set_property("is-live", true);
+    appsrc.set_property("do-timestamp", false); // 我们手动设置时间戳
     appsrc.set_format(gst::Format::Time);
+    net_parse.set_property("config-interval", -1);
+    net_caps.set_property("caps", &raw_video_caps); // 强制解码后的流符合统一格式
 
-    parse.set_property("config-interval", -1);
-
+    // 配置公共尾部
     sink.set_property("device", V4L2_DEVICE);
-    sink.set_property_from_str("sync", "false");
+    sink.set_property("sync", false); // 对实时流非常重要
 
-    // 3. 添加所有元素
+    // --- 3. 将所有元素添加到管线 ---
     pipeline.add_many(&[
         &standby_src,
         &standby_caps,
-        &standby_convert,
-        &standby_enc,
-        &standby_h264_caps,
         &appsrc_element,
-        &net_queue,
+        &net_parse,
+        &net_decode,
+        &net_convert,
+        &net_caps,
         &selector,
-        &parse,
-        &decode,
+        &common_queue,
         &common_convert,
         &sink,
     ])?;
 
-    // 4. 链接管线
-    gst::Element::link_many(&[
-        &standby_src,
-        &standby_caps,
-        &standby_convert,
-        &standby_enc,
-        &standby_h264_caps,
-    ])?;
-    let standby_enc_pad = standby_h264_caps.static_pad("src").unwrap();
+    // --- 4. 链接管线元素 ---
+
+    // 链接待机分支到 selector.sink_0
+    gst::Element::link_many(&[&standby_src, &standby_caps])?;
+    let standby_pad = standby_caps.static_pad("src").unwrap();
     let selector_sink_0 = selector.request_pad_simple("sink_0").unwrap();
-    standby_enc_pad.link(&selector_sink_0)?;
+    standby_pad.link(&selector_sink_0)?;
 
-    gst::Element::link_many(&[&appsrc_element, &net_queue])?;
-    let net_queue_pad = net_queue.static_pad("src").unwrap();
+    // 链接网络分支到 selector.sink_1
+    gst::Element::link_many(&[
+        &appsrc_element,
+        &net_parse,
+        &net_decode,
+        &net_convert,
+        &net_caps,
+    ])?;
+    let net_pad = net_caps.static_pad("src").unwrap();
     let selector_sink_1 = selector.request_pad_simple("sink_1").unwrap();
-    net_queue_pad.link(&selector_sink_1)?;
+    net_pad.link(&selector_sink_1)?;
 
-    selector.link(&parse)?;
-    gst::Element::link_many(&[&parse, &decode, &common_convert, &sink])?;
+    // 链接公共尾部
+    gst::Element::link_many(&[&selector, &common_queue, &common_convert, &sink])?;
 
-    // 5. 设置初始状态
+    // --- 5. 设置初始状态 ---
+    // 初始激活待机画面的输入端口 (sink_0)
     selector.set_property("active-pad", &selector_sink_0);
 
-    println!("[GStreamer] Final, robust pipeline created according to your final diagnosis.");
+    println!("[GStreamer] Robust pipeline created. Switching will happen in the raw video domain.");
     Ok(FinalPipeline {
         pipeline,
         appsrc: appsrc.clone(),
         selector,
     })
 }
+
+// =========================================================================================
+//  main() 和其他辅助函数无需任何修改，它们已经写得很好了。
+//  下面的代码保持原样。
+// =========================================================================================
 
 #[derive(Debug, PartialEq, Eq)]
 enum PacketOutcome {
@@ -197,7 +216,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Timeout
                 if signal_active && last_packet_time.elapsed() > SIGNAL_TIMEOUT {
                     println!("[STATE] Signal Lost! Switching back to Standby Stream...");
-                    // 您的修复方案：切换回待机时，重置管线状态以确保健壮性
+
+                    // 你的超时恢复逻辑是正确的，这里保留
                     pipeline.set_state(gst::State::Paused)?;
                     selector.set_property("active-pad", &standby_pad);
                     pipeline.set_state(gst::State::Playing)?;
@@ -269,7 +289,6 @@ async fn handle_udp_packet(
         let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
 
         if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
-            // 您的修复方案：在推送 buffer 前加长度检查，杜绝空帧进入管线
             if complete_frame.is_empty() {
                 eprintln!(
                     "[ERROR] Reassembled a zero-length frame for ID {}, skipping push.",
