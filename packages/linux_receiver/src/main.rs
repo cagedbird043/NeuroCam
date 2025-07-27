@@ -66,8 +66,7 @@ impl FrameReassembler {
 
 fn create_video_pipeline() -> Result<(gst::Pipeline, gst_app::AppSrc)> {
     let pipeline_str = format!(
-        // 添加 `queue` 元素可以增加管线的健壮性，处理微小的速度抖动
-        "appsrc name=src caps=\"video/x-h264,stream-format=byte-stream\" ! queue ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=YUY2 ! v4l2sink name=sink device={}",
+        "appsrc name=src caps=\"video/x-h264,stream-format=byte-stream\" ! queue ! h264parse ! avdec_h264 ! videoconvert ! videoflip method=1 ! video/x-raw,format=YUY2 ! v4l2sink name=sink device={}",
         V4L2_DEVICE
     );
 
@@ -123,9 +122,30 @@ async fn main() -> Result<()> {
     let pipeline_start_time = Instant::now(); // 我们需要一个固定的时间起点来计算buffer的PTS
 
     // 3. 进入主循环，只做一件事：接收UDP包
+    let mut last_remote_ip: Option<std::net::IpAddr> = None;
+
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, remote_addr)) => {
+                let current_ip = remote_addr.ip();
+                let is_new_source = match last_remote_ip {
+                    Some(ip) => current_ip != ip,
+                    None => true,
+                };
+                if is_new_source {
+                    println!(
+                    "[SWITCH] Source IP changed from {:?} to {}. Resetting pipeline, clearing reassemblers, and requesting I-Frame.",
+                    last_remote_ip,
+                    current_ip
+                );
+                    // 只在真正切换时赋值
+                    last_remote_ip = Some(current_ip);
+                    pipeline.set_state(gst::State::Null)?;
+                    pipeline.set_state(gst::State::Playing)?;
+                    reassemblers.clear();
+                    requested_initial_iframe = false;
+                }
+
                 // 如果这是我们收到的第一个包，立即向发送端请求一个I-frame
                 if !requested_initial_iframe {
                     println!(
@@ -145,10 +165,10 @@ async fn main() -> Result<()> {
                     &buf,
                     &remote_addr,
                     &mut reassemblers,
-                    &appsrc, // 直接传递 appsrc
+                    &appsrc,
                     &socket,
                     &mut latency_history,
-                    pipeline_start_time, // 传递固定的起始时间
+                    pipeline_start_time,
                 )
                 .await;
             }
@@ -177,6 +197,13 @@ async fn handle_udp_packet(
             let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
 
             if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
+                // 新增：丢弃空帧，防止 v4l2sink/ffplay 崩溃
+                if complete_frame.is_empty() {
+                    eprintln!("[WARN] Dropped empty frame (size=0), skipping push to appsrc.");
+                    reassemblers.remove(&header.frame_id);
+                    return;
+                }
+
                 let arrival_time_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -194,9 +221,9 @@ async fn handle_udp_packet(
                     latency_history.iter().sum::<f64>() / latency_history.len() as f64;
 
                 println!(
-                    "[FRAME] #{:<5} | Size: {:>5} KB | Latency (now): {:>6.2} ms | Latency (avg): {:>6.2} ms",
+                    "[FRAME] #{:<5} | Size: {:>5} bytes | Latency (now): {:>6.2} ms | Latency (avg): {:>6.2} ms",
                     header.frame_id,
-                    complete_frame.len() / 1024,
+                    complete_frame.len(),
                     log_latency_ms,
                     avg_latency,
                 );

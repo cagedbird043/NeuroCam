@@ -1,0 +1,10 @@
+# --- packages/standby_feeder/Cargo.toml ---
+[package]
+name = "standby_feeder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
