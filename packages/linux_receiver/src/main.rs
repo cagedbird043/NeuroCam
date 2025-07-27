@@ -1,4 +1,4 @@
-// --- packages/linux_receiver/src/main.rs (THE ULTIMATE TEE/FAKESINK PATTERN) ---
+// --- packages/linux_receiver/src/main.rs (THE FINAL BUG FIX) ---
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -19,27 +19,29 @@ const SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const VIDEO_WIDTH: i32 = 640;
 const VIDEO_HEIGHT: i32 = 480;
 
+// ================== CRITICAL FIX 1: Struct holding the pads ==================
+// The struct now holds the Pad objects we need to control the selector
 struct FinalPipeline {
     pipeline: gst::Pipeline,
     appsrc: gst_app::AppSrc,
     selector: gst::Element,
+    standby_pad: gst::Pad, // The correct pad for the standby stream
+    network_pad: gst::Pad, // The correct pad for the network stream
 }
+// ============================================================================
 
 /// 创建最终的、解耦的、工业级稳定的管线
-/// 终极模式: 使用 tee 和 fakesink 创建一个“泄压阀”，确保管线永不因 Sink 阻塞而冻结。
 fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     gst::init()?;
     let pipeline = gst::Pipeline::new();
 
-    // --- 1. 创建所有 GStreamer 元素 ---
-
+    // --- 1. 创建元素 ---
     let raw_video_caps = gst::Caps::builder("video/x-raw")
         .field("width", VIDEO_WIDTH)
         .field("height", VIDEO_HEIGHT)
         .field("format", "I420")
         .build();
 
-    // 输入分支
     let standby_src = gst::ElementFactory::make("videotestsrc")
         .name("standby_src")
         .build()?;
@@ -67,13 +69,11 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         .name("net_queue")
         .build()?;
 
-    // 切换与分流
     let selector = gst::ElementFactory::make("input-selector")
         .name("selector")
         .build()?;
     let tee = gst::ElementFactory::make("tee").name("tee").build()?;
 
-    // 输出分支 1: v4l2loopback (可能会阻塞)
     let v4l2_queue = gst::ElementFactory::make("queue")
         .name("v4l2_queue")
         .build()?;
@@ -84,7 +84,6 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         .name("v4l2_sink")
         .build()?;
 
-    // 输出分支 2: 泄压阀 (永远畅通)
     let fake_queue = gst::ElementFactory::make("queue")
         .name("fake_queue")
         .build()?;
@@ -92,8 +91,7 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         .name("fakesink")
         .build()?;
 
-    // --- 2. 配置元素属性 ---
-
+    // --- 2. 配置属性 ---
     standby_src.set_property_from_str("is-live", "true");
     standby_src.set_property_from_str("pattern", "smpte");
     standby_caps.set_property("caps", &raw_video_caps);
@@ -111,10 +109,7 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
 
     v4l2_sink.set_property("device", V4L2_DEVICE);
     v4l2_sink.set_property_from_str("sync", "false");
-
-    // 配置 fakesink，让它不影响管线时钟，并尽快消费数据
     fake_sink.set_property_from_str("sync", "false");
-    fake_sink.set_property_from_str("async", "false");
 
     // --- 3. 添加到管线 ---
     pipeline.add_many(&[
@@ -138,8 +133,14 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
 
     // --- 4. 链接元素 ---
 
-    // 链接输入分支到 selector
-    gst::Element::link_many(&[&standby_src, &standby_caps, &standby_queue, &selector])?;
+    // ================== CRITICAL FIX 2: Requesting and linking pads ==================
+    // Request and link standby branch to sink_0
+    gst::Element::link_many(&[&standby_src, &standby_caps, &standby_queue])?;
+    let standby_src_pad = standby_queue.static_pad("src").unwrap();
+    let selector_sink_0 = selector.request_pad_simple("sink_0").unwrap();
+    standby_src_pad.link(&selector_sink_0)?;
+
+    // Request and link network branch to sink_1
     gst::Element::link_many(&[
         &appsrc_element,
         &net_parse,
@@ -148,38 +149,38 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         &net_caps,
         &net_queue,
     ])?;
-    let net_pad = net_queue.static_pad("src").unwrap();
+    let net_src_pad = net_queue.static_pad("src").unwrap();
     let selector_sink_1 = selector.request_pad_simple("sink_1").unwrap();
-    net_pad.link(&selector_sink_1)?;
+    net_src_pad.link(&selector_sink_1)?;
+    // =================================================================================
 
-    // 链接 selector 到 tee
     selector.link(&tee)?;
 
-    // 链接 tee 的两个输出分支
     let tee_v4l2_pad = tee.request_pad_simple("src_%u").unwrap();
-    gst::Element::link_many(&[&v4l2_queue, &v4l2_convert, &v4l2_sink])?;
     let v4l2_queue_pad = v4l2_queue.static_pad("sink").unwrap();
     tee_v4l2_pad.link(&v4l2_queue_pad)?;
+    gst::Element::link_many(&[&v4l2_queue, &v4l2_convert, &v4l2_sink])?;
 
     let tee_fake_pad = tee.request_pad_simple("src_%u").unwrap();
-    gst::Element::link_many(&[&fake_queue, &fake_sink])?;
     let fake_queue_pad = fake_queue.static_pad("sink").unwrap();
     tee_fake_pad.link(&fake_queue_pad)?;
+    fake_queue.link(&fake_sink)?;
 
     // --- 5. 设置初始状态 ---
-    selector.set_property("active-pad", &selector.static_pad("sink_0").unwrap());
+    selector.set_property("active-pad", &selector_sink_0);
 
     println!("[GStreamer] The ultimate pipeline with Tee/Fakesink pressure relief is created.");
+
+    // ================== CRITICAL FIX 3: Returning the correct pads ==================
     Ok(FinalPipeline {
         pipeline,
         appsrc: appsrc.clone(),
         selector,
+        standby_pad: selector_sink_0, // Return the pad we actually used for linking
+        network_pad: selector_sink_1, // Return the pad we actually used for linking
     })
+    // ============================================================================
 }
-
-// =========================================================================================
-//  main() 和其他辅助函数无需任何修改。
-// =========================================================================================
 
 #[derive(Debug, PartialEq, Eq)]
 enum PacketOutcome {
@@ -195,8 +196,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let pipeline = p.pipeline;
     let appsrc = p.appsrc;
     let selector = p.selector;
-    let standby_pad = selector.static_pad("sink_0").unwrap();
-    let network_pad = selector.static_pad("sink_1").unwrap();
+
+    // ================== CRITICAL FIX 4: Using the pads from the struct ==================
+    // Use the pads that were returned from the setup function.
+    // Do NOT re-query them with static_pad.
+    let standby_pad = p.standby_pad;
+    let network_pad = p.network_pad;
+    // ===================================================================================
 
     let socket = Arc::new(UdpSocket::bind(LISTEN_ADDR).await?);
     let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
@@ -228,17 +234,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 if !signal_active && matches!(outcome, Some(PacketOutcome::IFrameReceived)) {
                     println!("[STATE] First I-Frame Received! Switching to Network Stream...");
+                    // Now this call uses the 100% correct Pad object
                     selector.set_property("active-pad", &network_pad);
                     signal_active = true;
                     stream_start_time = Some(std::time::Instant::now());
                 }
             }
             Err(_) => {
-                // Timeout
                 if signal_active && last_packet_time.elapsed() > SIGNAL_TIMEOUT {
                     println!("[STATE] Signal Lost! Switching back to Standby Stream...");
 
                     pipeline.set_state(gst::State::Paused)?;
+                    // This call also uses the 100% correct Pad object
                     selector.set_property("active-pad", &standby_pad);
                     pipeline.set_state(gst::State::Playing)?;
 
@@ -253,6 +260,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+// The rest of the file (FrameReassembler, handle_udp_packet) remains unchanged.
 struct FrameReassembler {
     packets: Vec<Option<Vec<u8>>>,
     received_count: u16,
