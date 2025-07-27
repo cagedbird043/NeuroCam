@@ -1,4 +1,4 @@
-// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt (FINAL VERSION) ---
+// --- packages/android_sender/app/src/main/java/com/neurocam/VideoEncoder.kt (THE DEFINITIVE FIX) ---
 package com.neurocam
 
 import android.media.MediaCodec
@@ -50,13 +50,17 @@ class VideoEncoder(
                 setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
 
-                // ================== 您的最终修复方案：强制每个I帧都带SPS/PPS ==================
-                // 这个键在API 29+上可用，确保解码器在任何时候都能从I帧开始解码
+                // ================== THE MOST IMPORTANT FIX OF THE ENTIRE PROJECT ==================
+                // We MUST force the encoder to use the same profile that the receiver expects.
+                // The receiver is hardcoded to expect "baseline" profile for maximum compatibility.
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                Log.i(TAG, "H.264 profile forced to aac_profile_baseline.")
+                // ===================================================================================
+
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                     setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
                     Log.i(TAG, "SPS/PPS prepending to I-frames is enabled.")
                 }
-                // =========================================================================
             }
             mediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
             mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
