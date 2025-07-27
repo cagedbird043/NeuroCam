@@ -1,4 +1,4 @@
-// --- packages/linux_receiver/src/main.rs (THE DEFINITIVE SOLUTION, GUIDED BY YOU) ---
+// --- packages/linux_receiver/src/main.rs (THE FINAL, DECOUPLED-DECODER ARCHITECTURE) ---
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -22,53 +22,63 @@ struct FinalPipeline {
     selector: gst::Element,
 }
 
-/// 创建最终的、解耦的、工业级稳定的管线 (结构已验证正确)
+/// 创建最终的、使用双解码器隔离的、工业级稳定管线
 fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     gst::init()?;
     let pipeline = gst::Pipeline::new();
 
+    // 1. 创建所有元素
+    // -- 源 --
     let standby_src = gst::ElementFactory::make("videotestsrc")
         .name("standby_src")
         .build()?;
     let standby_caps = gst::ElementFactory::make("capsfilter")
         .name("standby_caps")
         .build()?;
-    let standby_convert = gst::ElementFactory::make("videoconvert")
-        .name("standby_convert")
-        .build()?;
     let standby_enc = gst::ElementFactory::make("x264enc")
         .name("standby_encoder")
         .build()?;
-
     let appsrc_element = gst::ElementFactory::make("appsrc").name("appsrc").build()?;
-    let net_queue = gst::ElementFactory::make("queue")
-        .name("net_queue")
-        .build()?;
 
-    let selector = gst::ElementFactory::make("input-selector")
-        .name("selector")
-        .build()?;
-
+    // -- 合并器与分发器 --
+    let funnel = gst::ElementFactory::make("funnel").name("funnel").build()?;
     let parse = gst::ElementFactory::make("h264parse")
         .name("parser")
         .build()?;
-    let decode = gst::ElementFactory::make("avdec_h264")
-        .name("decoder")
+    let tee = gst::ElementFactory::make("tee").name("tee").build()?;
+
+    // -- 解码分支 1 (待机) --
+    let queue1 = gst::ElementFactory::make("queue").name("queue1").build()?;
+    let dec1 = gst::ElementFactory::make("avdec_h264")
+        .name("dec1")
         .build()?;
-    let common_convert = gst::ElementFactory::make("videoconvert")
-        .name("common_convert")
+    let conv1 = gst::ElementFactory::make("videoconvert")
+        .name("conv1")
+        .build()?;
+
+    // -- 解码分支 2 (网络) --
+    let queue2 = gst::ElementFactory::make("queue").name("queue2").build()?;
+    let dec2 = gst::ElementFactory::make("avdec_h264")
+        .name("dec2")
+        .build()?;
+    let conv2 = gst::ElementFactory::make("videoconvert")
+        .name("conv2")
+        .build()?;
+
+    // -- 最终切换器与输出 --
+    let selector = gst::ElementFactory::make("input-selector")
+        .name("selector")
         .build()?;
     let sink = gst::ElementFactory::make("v4l2sink").name("sink").build()?;
 
+    // 2. 配置元素
     standby_src.set_property_from_str("is-live", "true");
     standby_src.set_property_from_str("pattern", "smpte");
-
     let raw_video_caps = gst::Caps::builder("video/x-raw")
         .field("width", 640)
         .field("height", 480)
         .build();
     standby_caps.set_property("caps", &raw_video_caps);
-
     standby_enc.set_property_from_str("tune", "zerolatency");
 
     let appsrc = appsrc_element.downcast_ref::<gst_app::AppSrc>().unwrap();
@@ -80,41 +90,59 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     appsrc.set_property_from_str("do-timestamp", "false");
     appsrc.set_format(gst::Format::Time);
 
-    parse.set_property("config-interval", -1);
-
     sink.set_property("device", V4L2_DEVICE);
     sink.set_property_from_str("sync", "false");
 
+    // 3. 添加所有元素
     pipeline.add_many(&[
         &standby_src,
         &standby_caps,
-        &standby_convert,
         &standby_enc,
         &appsrc_element,
-        &net_queue,
-        &selector,
+        &funnel,
         &parse,
-        &decode,
-        &common_convert,
+        &tee,
+        &queue1,
+        &dec1,
+        &conv1,
+        &queue2,
+        &dec2,
+        &conv2,
+        &selector,
         &sink,
     ])?;
 
-    gst::Element::link_many(&[&standby_src, &standby_caps, &standby_convert, &standby_enc])?;
-    let standby_enc_pad = standby_enc.static_pad("src").unwrap();
-    let selector_sink_0 = selector.request_pad_simple("sink_0").unwrap();
-    standby_enc_pad.link(&selector_sink_0)?;
+    // 4. 链接管线
+    // -- 源到 funnel --
+    gst::Element::link_many(&[&standby_src, &standby_caps, &standby_enc])?;
+    standby_enc.link(&funnel)?;
+    appsrc_element.link(&funnel)?;
 
-    gst::Element::link_many(&[&appsrc_element, &net_queue])?;
-    let net_queue_pad = net_queue.static_pad("src").unwrap();
-    let selector_sink_1 = selector.request_pad_simple("sink_1").unwrap();
-    net_queue_pad.link(&selector_sink_1)?;
+    // -- funnel 到 tee --
+    gst::Element::link_many(&[&funnel, &parse, &tee])?;
 
-    selector.link(&parse)?;
-    gst::Element::link_many(&[&parse, &decode, &common_convert, &sink])?;
+    // -- tee 到两个解码分支 --
+    gst::Element::link_many(&[&queue1, &dec1, &conv1])?;
+    let tee_src_pad1 = tee.request_pad_simple("src_%u").unwrap();
+    let q1_sink_pad = queue1.static_pad("sink").unwrap();
+    tee_src_pad1.link(&q1_sink_pad)?;
 
-    selector.set_property("active-pad", &selector_sink_0);
+    gst::Element::link_many(&[&queue2, &dec2, &conv2])?;
+    let tee_src_pad2 = tee.request_pad_simple("src_%u").unwrap();
+    let q2_sink_pad = queue2.static_pad("sink").unwrap();
+    tee_src_pad2.link(&q2_sink_pad)?;
 
-    println!("[GStreamer] Final, robust pipeline created. Awaiting I-frame to switch.");
+    // -- 两个解码分支到 selector --
+    conv1.link(&selector)?; // 默认链接到 sink_0
+    conv2.link(&selector)?; // 默认链接到 sink_1
+
+    // -- selector 到 sink --
+    selector.link(&sink)?;
+
+    // 5. 将 funnel 的行为设置为，只激活一个输入
+    funnel.set_property_from_str("forward-sticky-events", "true");
+
+    println!("[GStreamer] Final, dual-decoder architecture created. All systems nominal.");
     Ok(FinalPipeline {
         pipeline,
         appsrc: appsrc.clone(),
@@ -122,19 +150,11 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     })
 }
 
-/// 定义 handle_udp_packet 的返回结果，用于通知主循环
-#[derive(Debug, PartialEq, Eq)]
-enum PacketOutcome {
-    FrameProcessed,
-    IFrameReceived, // 这是一个关键信号
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let p = create_final_pipeline()?;
     p.pipeline.set_state(gst::State::Playing)?;
 
-    let pipeline = p.pipeline;
     let appsrc = p.appsrc;
     let selector = p.selector;
     let standby_pad = selector.static_pad("sink_0").unwrap();
@@ -146,7 +166,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut signal_active = false;
     let mut last_packet_time = std::time::Instant::now();
-    let mut stream_start_time: Option<std::time::Instant> = None;
 
     loop {
         let recv_result = tokio::time::timeout(
@@ -156,40 +175,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await;
         match recv_result {
             Ok(Ok((len, remote_addr))) => {
-                last_packet_time = std::time::Instant::now();
-                let outcome = handle_udp_packet(
-                    len,
-                    &buf,
-                    &remote_addr,
-                    &appsrc,
-                    &socket,
-                    &mut reassemblers,
-                    stream_start_time,
-                )
-                .await;
-
-                // ================== 核心修正：只有收到I帧才切换 ==================
-                if !signal_active && matches!(outcome, Some(PacketOutcome::IFrameReceived)) {
-                    println!("[STATE] First I-Frame Received! Switching to Network Stream...");
+                if !signal_active {
+                    println!("[STATE] Signal Acquired! Switching to Network Stream...");
                     selector.set_property("active-pad", &network_pad);
                     signal_active = true;
-                    stream_start_time = Some(std::time::Instant::now());
                 }
-                // =============================================================
+                last_packet_time = std::time::Instant::now();
+                handle_udp_packet(len, &buf, &remote_addr, &appsrc, &mut reassemblers, &socket)
+                    .await;
             }
             Err(_) => {
                 // Timeout
                 if signal_active && last_packet_time.elapsed() > SIGNAL_TIMEOUT {
                     println!("[STATE] Signal Lost! Switching back to Standby Stream...");
-                    // ================== 核心修正：切换回待机时，重置管线状态 ==================
-                    pipeline.set_state(gst::State::Paused)?;
                     selector.set_property("active-pad", &standby_pad);
-                    pipeline.set_state(gst::State::Playing)?;
-                    // =====================================================================
                     signal_active = false;
                     reassemblers.clear();
-                    stream_start_time = None;
-                    println!("[STATE] Switched back to standby and pipeline restarted.");
                 }
             }
             Ok(Err(e)) => eprintln!("[ERROR] UDP recv error: {}", e),
@@ -202,7 +203,6 @@ struct FrameReassembler {
     received_count: u16,
     total_packets: u16,
     is_key_frame: bool,
-    frame_id: u32,
 }
 impl FrameReassembler {
     fn new(header: &DataHeader) -> Self {
@@ -211,7 +211,6 @@ impl FrameReassembler {
             received_count: 0,
             total_packets: header.total_packets,
             is_key_frame: header.is_key_frame != 0,
-            frame_id: header.frame_id,
         }
     }
     fn add_packet(&mut self, packet_id: u16, data: Vec<u8>) -> Option<Vec<u8>> {
@@ -238,52 +237,31 @@ async fn handle_udp_packet(
     buf: &[u8],
     remote_addr: &SocketAddr,
     appsrc: &gst_app::AppSrc,
-    socket: &Arc<UdpSocket>,
     reassemblers: &mut HashMap<u32, FrameReassembler>,
-    stream_start_time: Option<std::time::Instant>,
-) -> Option<PacketOutcome> {
-    // <-- 返回值用于通知主循环
-    if len <= DATA_HEADER_SIZE || PacketType::try_from(buf[0]).is_err() {
-        return None;
-    }
+    socket: &Arc<UdpSocket>,
+) {
+    if len > DATA_HEADER_SIZE && PacketType::try_from(buf[0]).is_ok() {
+        if let Some(header) = DataHeader::from_bytes(&buf[1..]) {
+            let reassembler = reassemblers
+                .entry(header.frame_id)
+                .or_insert_with(|| FrameReassembler::new(&header));
+            let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
+            if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
+                // We no longer need to manage timestamps, GStreamer will handle it.
+                let gst_buffer = gst::Buffer::from_slice(complete_frame);
+                let _ = appsrc.push_buffer(gst_buffer);
 
-    if let Some(header) = DataHeader::from_bytes(&buf[1..]) {
-        let reassembler = reassemblers
-            .entry(header.frame_id)
-            .or_insert_with(|| FrameReassembler::new(&header));
-        let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
-
-        if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
-            let mut gst_buffer = gst::Buffer::with_size(complete_frame.len()).unwrap();
-            let buffer_ref = gst_buffer.get_mut().unwrap();
-            {
-                let mut map = buffer_ref.map_writable().unwrap();
-                map.copy_from_slice(&complete_frame);
-            }
-            if let Some(start_time) = stream_start_time {
-                let running_time = std::time::Instant::now().saturating_duration_since(start_time);
-                buffer_ref.set_pts(Some(gst::ClockTime::from_nseconds(
-                    running_time.as_nanos() as u64
-                )));
-            }
-            let _ = appsrc.push_buffer(gst_buffer);
-
-            let is_key_frame = reassembler.is_key_frame;
-            reassemblers.remove(&header.frame_id);
-
-            if is_key_frame {
-                let ack = AckPacket {
-                    frame_id: header.frame_id,
-                };
-                let mut ack_buf = [0u8; 1 + ACK_PACKET_SIZE];
-                ack_buf[0] = PacketType::Ack as u8;
-                ack_buf[1..].copy_from_slice(&ack.to_bytes());
-                let _ = socket.send_to(&ack_buf, remote_addr).await;
-                return Some(PacketOutcome::IFrameReceived); // <-- 通知主循环！
-            } else {
-                return Some(PacketOutcome::FrameProcessed);
+                if reassembler.is_key_frame {
+                    let ack = AckPacket {
+                        frame_id: header.frame_id,
+                    };
+                    let mut ack_buf = [0u8; 1 + ACK_PACKET_SIZE];
+                    ack_buf[0] = PacketType::Ack as u8;
+                    ack_buf[1..].copy_from_slice(&ack.to_bytes());
+                    let _ = socket.send_to(&ack_buf, remote_addr).await;
+                }
+                reassemblers.remove(&header.frame_id);
             }
         }
     }
-    None
 }
