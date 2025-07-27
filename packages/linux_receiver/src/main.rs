@@ -1,4 +1,4 @@
-// --- packages/linux_receiver/src/main.rs (THE ULTIMATE AND FINAL VERSION) ---
+// --- packages/linux_receiver/src/main.rs (THE ULTIMATE TEE/FAKESINK PATTERN) ---
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -26,9 +26,7 @@ struct FinalPipeline {
 }
 
 /// 创建最终的、解耦的、工业级稳定的管线
-/// 法则 1: 在 raw video 域进行切换
-/// 法则 2: 用 queue 解耦输入分支
-/// 法则 3 (最终法则): 用 leaky queue 防止 sink 阻塞整个管线
+/// 终极模式: 使用 tee 和 fakesink 创建一个“泄压阀”，确保管线永不因 Sink 阻塞而冻结。
 fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     gst::init()?;
     let pipeline = gst::Pipeline::new();
@@ -41,7 +39,7 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         .field("format", "I420")
         .build();
 
-    // 分支 1: 待机画面
+    // 输入分支
     let standby_src = gst::ElementFactory::make("videotestsrc")
         .name("standby_src")
         .build()?;
@@ -52,7 +50,6 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         .name("standby_queue")
         .build()?;
 
-    // 分支 2: 网络视频流
     let appsrc_element = gst::ElementFactory::make("appsrc").name("appsrc").build()?;
     let net_parse = gst::ElementFactory::make("h264parse")
         .name("net_parser")
@@ -70,25 +67,34 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         .name("net_queue")
         .build()?;
 
-    // 切换点
+    // 切换与分流
     let selector = gst::ElementFactory::make("input-selector")
         .name("selector")
         .build()?;
+    let tee = gst::ElementFactory::make("tee").name("tee").build()?;
 
-    // 公共尾部
-    let final_convert = gst::ElementFactory::make("videoconvert")
-        .name("final_convert")
+    // 输出分支 1: v4l2loopback (可能会阻塞)
+    let v4l2_queue = gst::ElementFactory::make("queue")
+        .name("v4l2_queue")
         .build()?;
-    let sink_queue = gst::ElementFactory::make("queue")
-        .name("sink_queue")
-        .build()?; // <-- 关键修复
-    let sink = gst::ElementFactory::make("v4l2sink")
+    let v4l2_convert = gst::ElementFactory::make("videoconvert")
+        .name("v4l2_convert")
+        .build()?;
+    let v4l2_sink = gst::ElementFactory::make("v4l2sink")
         .name("v4l2_sink")
+        .build()?;
+
+    // 输出分支 2: 泄压阀 (永远畅通)
+    let fake_queue = gst::ElementFactory::make("queue")
+        .name("fake_queue")
+        .build()?;
+    let fake_sink = gst::ElementFactory::make("fakesink")
+        .name("fakesink")
         .build()?;
 
     // --- 2. 配置元素属性 ---
 
-    standby_src.set_property("is-live", true);
+    standby_src.set_property_from_str("is-live", "true");
     standby_src.set_property_from_str("pattern", "smpte");
     standby_caps.set_property("caps", &raw_video_caps);
 
@@ -97,22 +103,18 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         "caps",
         "video/x-h264, stream-format=byte-stream, alignment=au, profile=baseline",
     );
-    appsrc.set_property("is-live", true);
-    appsrc.set_property("do-timestamp", false);
+    appsrc.set_property_from_str("is-live", "true");
+    appsrc.set_property_from_str("do-timestamp", "false");
     appsrc.set_format(gst::Format::Time);
-    net_parse.set_property("config-interval", -1);
+    net_parse.set_property_from_str("config-interval", "-1");
     net_caps.set_property("caps", &raw_video_caps);
 
-    // ================== CRITICAL FIX ==================
-    // 这个 queue 防止 v4l2sink 在没有客户端（如 ffplay）读取时阻塞整个管线。
-    // leaky=2 (downstream): 如果下游阻塞，则丢弃队列中最旧的缓冲区。
-    sink_queue.set_property_from_str("leaky", "downstream");
-    // 我们只关心最新的帧，所以一个很小的缓冲区就足够了。
-    sink_queue.set_property("max-size-buffers", 2u32);
-    // ================================================
+    v4l2_sink.set_property("device", V4L2_DEVICE);
+    v4l2_sink.set_property_from_str("sync", "false");
 
-    sink.set_property("device", V4L2_DEVICE);
-    sink.set_property("sync", false);
+    // 配置 fakesink，让它不影响管线时钟，并尽快消费数据
+    fake_sink.set_property_from_str("sync", "false");
+    fake_sink.set_property_from_str("async", "false");
 
     // --- 3. 添加到管线 ---
     pipeline.add_many(&[
@@ -126,17 +128,18 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
         &net_caps,
         &net_queue,
         &selector,
-        &final_convert,
-        &sink_queue,
-        &sink,
+        &tee,
+        &v4l2_queue,
+        &v4l2_convert,
+        &v4l2_sink,
+        &fake_queue,
+        &fake_sink,
     ])?;
 
     // --- 4. 链接元素 ---
-    gst::Element::link_many(&[&standby_src, &standby_caps, &standby_queue])?;
-    let standby_pad = standby_queue.static_pad("src").unwrap();
-    let selector_sink_0 = selector.request_pad_simple("sink_0").unwrap();
-    standby_pad.link(&selector_sink_0)?;
 
+    // 链接输入分支到 selector
+    gst::Element::link_many(&[&standby_src, &standby_caps, &standby_queue, &selector])?;
     gst::Element::link_many(&[
         &appsrc_element,
         &net_parse,
@@ -149,13 +152,24 @@ fn create_final_pipeline() -> Result<FinalPipeline, Box<dyn Error>> {
     let selector_sink_1 = selector.request_pad_simple("sink_1").unwrap();
     net_pad.link(&selector_sink_1)?;
 
-    // 链接公共尾部，包含我们的关键修复
-    gst::Element::link_many(&[&selector, &final_convert, &sink_queue, &sink])?;
+    // 链接 selector 到 tee
+    selector.link(&tee)?;
+
+    // 链接 tee 的两个输出分支
+    let tee_v4l2_pad = tee.request_pad_simple("src_%u").unwrap();
+    gst::Element::link_many(&[&v4l2_queue, &v4l2_convert, &v4l2_sink])?;
+    let v4l2_queue_pad = v4l2_queue.static_pad("sink").unwrap();
+    tee_v4l2_pad.link(&v4l2_queue_pad)?;
+
+    let tee_fake_pad = tee.request_pad_simple("src_%u").unwrap();
+    gst::Element::link_many(&[&fake_queue, &fake_sink])?;
+    let fake_queue_pad = fake_queue.static_pad("sink").unwrap();
+    tee_fake_pad.link(&fake_queue_pad)?;
 
     // --- 5. 设置初始状态 ---
-    selector.set_property("active-pad", &selector_sink_0);
+    selector.set_property("active-pad", &selector.static_pad("sink_0").unwrap());
 
-    println!("[GStreamer] The truly final, robust pipeline is created. Sink is non-blocking.");
+    println!("[GStreamer] The ultimate pipeline with Tee/Fakesink pressure relief is created.");
     Ok(FinalPipeline {
         pipeline,
         appsrc: appsrc.clone(),
