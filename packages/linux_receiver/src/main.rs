@@ -199,20 +199,36 @@ async fn handle_udp_packet(
     let sps_pps_cache = SPS_PPS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     // --- 新增结束 ---
 
+    use std::sync::Mutex;
+    static LAST_SPS_PPS: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+
     if len > 0 && PacketType::try_from(buf[0]) == Ok(PacketType::SpsPps) {
-        *sps_pps_cache.lock().unwrap() = Some(buf[1..len].to_vec());
-        *sps_pps_inject_count = 0;
-        println!("[INFO] SPS/PPS received via handshake, cached!");
-        if let Err(e) = pipeline.set_state(gst::State::Null) {
-            eprintln!("[ERROR] Failed to set pipeline to Null: {:?}", e);
-        }
-        if let Err(e) = pipeline.set_state(gst::State::Playing) {
-            eprintln!("[ERROR] Failed to set pipeline to Playing: {:?}", e);
-        }
-        // 新增：每次收到SPS/PPS都请求I-Frame
-        let request = [PacketType::IFrameRequest as u8];
-        if let Err(e) = socket.send_to(&request, remote_addr).await {
-            eprintln!("[ERROR] Failed to send I-Frame request: {}", e);
+        let new_sps_pps = buf[1..len].to_vec();
+        let last_sps_pps = LAST_SPS_PPS.get_or_init(|| Mutex::new(None));
+        let mut last_guard = last_sps_pps.lock().unwrap();
+        let changed = match &*last_guard {
+            Some(old) => *old != new_sps_pps,
+            None => true,
+        };
+        if changed {
+            println!("[INFO] SPS/PPS changed, restarting pipeline!");
+            *last_guard = Some(new_sps_pps.clone());
+            *sps_pps_cache.lock().unwrap() = Some(new_sps_pps);
+            *sps_pps_inject_count = 0;
+            if let Err(e) = pipeline.set_state(gst::State::Null) {
+                eprintln!("[ERROR] Failed to set pipeline to Null: {:?}", e);
+            }
+            if let Err(e) = pipeline.set_state(gst::State::Playing) {
+                eprintln!("[ERROR] Failed to set pipeline to Playing: {:?}", e);
+            }
+            // 只在变化时请求I-Frame
+            let request = [PacketType::IFrameRequest as u8];
+            if let Err(e) = socket.send_to(&request, remote_addr).await {
+                eprintln!("[ERROR] Failed to send I-Frame request: {}", e);
+            }
+        } else {
+            // 仅更新缓存，不重启pipeline
+            *sps_pps_cache.lock().unwrap() = Some(new_sps_pps);
         }
         return;
     }
