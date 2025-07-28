@@ -66,8 +66,7 @@ impl FrameReassembler {
 
 fn create_video_pipeline() -> Result<(gst::Pipeline, gst_app::AppSrc)> {
     let pipeline_str = format!(
-        // 添加 `queue` 元素可以增加管线的健壮性，处理微小的速度抖动
-        "appsrc name=src caps=\"video/x-h264,stream-format=byte-stream\" ! queue ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=YUY2 ! v4l2sink name=sink device={}",
+        "appsrc name=src caps=\"video/x-h264,stream-format=byte-stream\" ! queue ! h264parse ! avdec_h264 ! videoconvert ! videoflip method=1 ! video/x-raw,format=YUY2 ! v4l2sink name=sink device={}",
         V4L2_DEVICE
     );
 
@@ -123,9 +122,30 @@ async fn main() -> Result<()> {
     let pipeline_start_time = Instant::now(); // 我们需要一个固定的时间起点来计算buffer的PTS
 
     // 3. 进入主循环，只做一件事：接收UDP包
+    let mut last_remote_ip: Option<std::net::IpAddr> = None;
+    let mut sps_pps_inject_count = 0usize;
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, remote_addr)) => {
+                let current_ip = remote_addr.ip();
+                let is_new_source = match last_remote_ip {
+                    Some(ip) => current_ip != ip,
+                    None => true,
+                };
+                if is_new_source {
+                    println!(
+                    "[SWITCH] Source IP changed from {:?} to {}. Resetting pipeline, clearing reassemblers, and requesting I-Frame.",
+                    last_remote_ip,
+                    current_ip
+                );
+                    // 只在真正切换时赋值
+                    last_remote_ip = Some(current_ip);
+                    pipeline.set_state(gst::State::Null)?;
+                    pipeline.set_state(gst::State::Playing)?;
+                    reassemblers.clear();
+                    requested_initial_iframe = false;
+                }
+
                 // 如果这是我们收到的第一个包，立即向发送端请求一个I-frame
                 if !requested_initial_iframe {
                     println!(
@@ -145,10 +165,12 @@ async fn main() -> Result<()> {
                     &buf,
                     &remote_addr,
                     &mut reassemblers,
-                    &appsrc, // 直接传递 appsrc
+                    &appsrc,
                     &socket,
                     &mut latency_history,
-                    pipeline_start_time, // 传递固定的起始时间
+                    pipeline_start_time,
+                    &mut sps_pps_inject_count,
+                    &pipeline,
                 )
                 .await;
             }
@@ -164,11 +186,53 @@ async fn handle_udp_packet(
     buf: &[u8],
     remote_addr: &SocketAddr,
     reassemblers: &mut HashMap<u32, FrameReassembler>,
-    appsrc: &gst_app::AppSrc, // 修改参数，直接接收 appsrc
+    appsrc: &gst_app::AppSrc,
     socket: &Arc<UdpSocket>,
     latency_history: &mut VecDeque<f64>,
-    pipeline_start_time: Instant, // 修改参数，接收固定的起始时间
+    pipeline_start_time: Instant,
+    sps_pps_inject_count: &mut usize,
+    pipeline: &gst::Pipeline, // 新增
 ) {
+    // --- 新增：SPS/PPS缓存 ---
+    use std::sync::OnceLock;
+    static SPS_PPS_CACHE: OnceLock<std::sync::Mutex<Option<Vec<u8>>>> = OnceLock::new();
+    let sps_pps_cache = SPS_PPS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    // --- 新增结束 ---
+
+    use std::sync::Mutex;
+    static LAST_SPS_PPS: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+
+    if len > 0 && PacketType::try_from(buf[0]) == Ok(PacketType::SpsPps) {
+        let new_sps_pps = buf[1..len].to_vec();
+        let last_sps_pps = LAST_SPS_PPS.get_or_init(|| Mutex::new(None));
+        let mut last_guard = last_sps_pps.lock().unwrap();
+        let changed = match &*last_guard {
+            Some(old) => *old != new_sps_pps,
+            None => true,
+        };
+        if changed {
+            println!("[INFO] SPS/PPS changed, restarting pipeline!");
+            *last_guard = Some(new_sps_pps.clone());
+            *sps_pps_cache.lock().unwrap() = Some(new_sps_pps);
+            *sps_pps_inject_count = 0;
+            if let Err(e) = pipeline.set_state(gst::State::Null) {
+                eprintln!("[ERROR] Failed to set pipeline to Null: {:?}", e);
+            }
+            if let Err(e) = pipeline.set_state(gst::State::Playing) {
+                eprintln!("[ERROR] Failed to set pipeline to Playing: {:?}", e);
+            }
+            // 只在变化时请求I-Frame
+            let request = [PacketType::IFrameRequest as u8];
+            if let Err(e) = socket.send_to(&request, remote_addr).await {
+                eprintln!("[ERROR] Failed to send I-Frame request: {}", e);
+            }
+        } else {
+            // 仅更新缓存，不重启pipeline
+            *sps_pps_cache.lock().unwrap() = Some(new_sps_pps);
+        }
+        return;
+    }
+
     if len > 0 && PacketType::try_from(buf[0]) == Ok(PacketType::Data) {
         if let Some(header) = DataHeader::from_bytes(&buf[1..len]) {
             let reassembler = reassemblers
@@ -177,6 +241,53 @@ async fn handle_udp_packet(
             let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
 
             if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
+                // 丢弃空帧
+                if complete_frame.is_empty() {
+                    eprintln!("[WARN] Dropped empty frame (size=0), skipping push to appsrc.");
+                    reassemblers.remove(&header.frame_id);
+                    return;
+                }
+                if !reassembler.is_key_frame {
+                    // println!(
+                    //     "[DEBUG] Non-key frame: len={}, head={:02x?}",
+                    //     complete_frame.len(),
+                    //     &complete_frame[..std::cmp::min(32, complete_frame.len())]
+                    // );
+                }
+                if !reassembler.is_key_frame
+                    && complete_frame.len() < 8192
+                    && (complete_frame.windows(5).any(|w| w == [0, 0, 0, 1, 0x67])
+                        || complete_frame.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]))
+                {
+                    *sps_pps_cache.lock().unwrap() = Some(complete_frame.clone());
+                    reassemblers.remove(&header.frame_id);
+                    println!(
+                        "[INFO] SPS/PPS cached. len={}, head={:02x?}",
+                        complete_frame.len(),
+                        &complete_frame[..std::cmp::min(16, complete_frame.len())]
+                    );
+                    return;
+                }
+
+                // I帧前拼接缓存的SPS/PPS
+                let final_frame = if reassembler.is_key_frame {
+                    if *sps_pps_inject_count < 3 {
+                        if let Some(ref sps_pps) = *sps_pps_cache.lock().unwrap() {
+                            let mut v = sps_pps.clone();
+                            v.extend_from_slice(&complete_frame);
+                            *sps_pps_inject_count += 1;
+                            v
+                        } else {
+                            complete_frame.clone()
+                        }
+                    } else {
+                        complete_frame.clone()
+                    }
+                } else {
+                    complete_frame.clone()
+                };
+                // --- 新增结束 ---
+
                 let arrival_time_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -193,22 +304,21 @@ async fn handle_udp_packet(
                 let avg_latency: f64 =
                     latency_history.iter().sum::<f64>() / latency_history.len() as f64;
 
-                println!(
-                    "[FRAME] #{:<5} | Size: {:>5} KB | Latency (now): {:>6.2} ms | Latency (avg): {:>6.2} ms",
-                    header.frame_id,
-                    complete_frame.len() / 1024,
-                    log_latency_ms,
-                    avg_latency,
-                );
+                // println!(
+                //     "[FRAME] #{:<5} | Size: {:>5} bytes | Latency (now): {:>6.2} ms | Latency (avg): {:>6.2} ms",
+                //     header.frame_id,
+                //     final_frame.len(),
+                //     log_latency_ms,
+                //     avg_latency,
+                // );
 
-                let mut gst_buffer = gst::Buffer::with_size(complete_frame.len()).unwrap();
+                let mut gst_buffer = gst::Buffer::with_size(final_frame.len()).unwrap();
                 {
                     let mut_buffer = gst_buffer.get_mut().unwrap();
-                    // 核心时间戳逻辑：使用从管线启动到现在的持续时间作为 PTS
                     let running_time = Instant::now().duration_since(pipeline_start_time);
                     mut_buffer
                         .set_pts(gst::ClockTime::from_nseconds(running_time.as_nanos() as u64));
-                    mut_buffer.copy_from_slice(0, &complete_frame).unwrap();
+                    mut_buffer.copy_from_slice(0, &final_frame).unwrap();
                 }
 
                 if let Err(e) = appsrc.push_buffer(gst_buffer) {
@@ -241,4 +351,3 @@ async fn handle_udp_packet(
         }
     }
 }
-// --- 核心修改 END ---

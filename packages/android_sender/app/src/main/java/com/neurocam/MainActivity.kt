@@ -170,7 +170,9 @@ fun CameraPreview(modifier: Modifier = Modifier) {
                                         "Actual resolution: ${actualWidth}x${actualHeight}. Initializing encoder.")
                                 videoEncoder = VideoEncoder(width = actualWidth, height = actualHeight).apply {
                                     start()
+                                    startSpsPpsHeartbeat() // 关键：初始化后立即启动心跳
                                 }
+                                NativeBridge.videoEncoder = videoEncoder // 关键：赋值给 NativeBridge
                             }
                             videoEncoder?.encodeFrame(imageProxy)
                             imageProxy.close()
@@ -201,6 +203,7 @@ fun CameraPreview(modifier: Modifier = Modifier) {
         onDispose {
             Log.d("NeuroCam/MainScreen", "Disposing resources...")
             cameraExecutor.shutdown()
+            videoEncoder?.stopSpsPpsHeartbeat()
             videoEncoder?.stop()
         }
     }

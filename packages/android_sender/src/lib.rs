@@ -113,7 +113,6 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_init(mut env: JNIEnv, _cla
             logger::info("Control listener thread shutting down.");
         });
 
-        // ... (重传线程无变化)
         let socket_for_retry = Arc::clone(&UDP_SOCKET);
         let acked_frames_for_retry = Arc::clone(&ACKED_FRAMES);
         let unacked_iframes_for_retry = Arc::clone(&UNACKED_IFRAMES);
@@ -265,3 +264,21 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_close(_env: JNIEnv, _class
     // AI-MOD-END
 }
 // AI-MOD-END
+
+use jni::objects::JByteArray;
+
+#[no_mangle]
+pub extern "system" fn Java_com_neurocam_NativeBridge_sendSpsPps(
+    env: JNIEnv,
+    _class: JClass,
+    buffer: jni::sys::jbyteArray,
+    size: jni::sys::jint,
+) {
+    let size = size as usize;
+    let jarray = unsafe { JByteArray::from_raw(buffer) }; // 关键：用 from_raw
+    let spspps = env.convert_byte_array(jarray).unwrap();
+    let mut packet = Vec::with_capacity(1 + size);
+    packet.push(PacketType::SpsPps as u8);
+    packet.extend_from_slice(&spspps[..size]);
+    let _ = UDP_SOCKET.send_to(&packet, TARGET_ADDR);
+}

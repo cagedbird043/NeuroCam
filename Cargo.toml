@@ -1,9 +1,9 @@
-# --- Cargo.toml ---
-
+# --- NeuroCam/Cargo.toml ---
 [workspace]
 members = [
     "packages/protocol",
     "packages/linux_receiver",
     "packages/android_sender",
+    "packages/standby_feeder", # <-- 添加此行
 ]
 resolver = "2"
