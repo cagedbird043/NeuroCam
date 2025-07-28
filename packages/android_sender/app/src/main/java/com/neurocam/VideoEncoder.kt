@@ -32,7 +32,7 @@ class VideoEncoder(
     private var mediaCodec: MediaCodec? = null
     private var isRunning = false
 
-    // AI-MOD-START
+    
     /**
      *  请求编码器立即生成一个关键帧 (I-frame)。
      *  这是一个异步请求，编码器将在下一个可用的时机生成I-frame。
@@ -51,7 +51,7 @@ class VideoEncoder(
             Log.e(TAG, "Failed to request key frame", e)
         }
     }
-    // AI-MOD-END
+    
 
     fun nv21ToNv12(nv21: ByteArray, width: Int, height: Int): ByteArray {
         val nv12 = ByteArray(nv21.size)

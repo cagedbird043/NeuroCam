@@ -29,7 +29,7 @@ object NativeBridge {
 
     external fun init()
 
-    // AI-MOD-START
+    
     /**
      * 发送一个视频帧到 Rust 层进行处理。
      * @param frameBuffer 一个包含 H.264 编码数据的 Direct ByteBuffer。

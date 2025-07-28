@@ -1,6 +1,5 @@
 // --- packages/android_sender/src/lib.rs ---
 
-// AI-MOD-START
 use jni::objects::{GlobalRef, JByteBuffer, JClass};
 use jni::sys::jboolean;
 use jni::{JNIEnv, JavaVM};
@@ -188,9 +187,8 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
     frame_buffer: JByteBuffer,
     size: jni::sys::jint,
     is_key_frame: jboolean,
-    // AI-MOD-START
+
     capture_timestamp_ns: jni::sys::jlong, // 新增时间戳参数
-                                           // AI-MOD-END
 ) {
     let Ok(data_ptr) = _env.get_direct_buffer_address(&frame_buffer) else {
         logger::error("[Rust] Failed to get direct buffer address.");
@@ -208,7 +206,6 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
     };
 
     for (i, chunk) in chunks.iter().enumerate() {
-        // AI-MOD-START
         let header = DataHeader {
             frame_id,
             capture_timestamp_ns: capture_timestamp_ns as u64,
@@ -216,7 +213,6 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
             total_packets,
             is_key_frame: is_key_frame as u8,
         };
-        // AI-MOD-END
 
         let mut packet_data = Vec::with_capacity(1 + DATA_HEADER_SIZE + chunk.len());
         packet_data.push(PacketType::Data as u8);
@@ -242,7 +238,6 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_sendVideoFrame(
 
 #[no_mangle]
 pub extern "system" fn Java_com_neurocam_NativeBridge_close(_env: JNIEnv, _class: JClass) {
-    // AI-MOD-START
     logger::info("NativeBridge_close called. Signaling threads to shut down...");
     SHUTDOWN_FLAG.store(true, Ordering::Relaxed);
 
@@ -261,9 +256,7 @@ pub extern "system" fn Java_com_neurocam_NativeBridge_close(_env: JNIEnv, _class
     // 当进程终止时，它所占用的资源会被操作系统回收。
     // 在 `jni-rs` 中，GlobalRef 的 Drop trait 会自动处理 JNI 的删除逻辑。
     // 因此，此处无需也无法手动删除。
-    // AI-MOD-END
 }
-// AI-MOD-END
 
 use jni::objects::JByteArray;
 

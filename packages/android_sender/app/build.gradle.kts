@@ -66,7 +66,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // AI-MOD-START
+    
     // 添加 CameraX 依赖
     // camera-core: 核心 API
     // camera-camera2: Camera2 实现，CameraX 构建于其上
@@ -76,7 +76,7 @@ dependencies {
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
-    // AI-MOD-END
+    
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

@@ -48,7 +48,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // AI-MOD-START
+        
         // 核心修复：将 NativeBridge.init() 移到后台线程。
         // lifecycleScope 会将协程的生命周期与 Activity 绑定，当 Activity 销毁时自动取消。
         // Dispatchers.IO 是专门为网络和磁盘 I/O 操作优化的线程池。
@@ -56,7 +56,7 @@ class MainActivity : ComponentActivity() {
             NativeBridge.init()
             Log.i("NeuroCam/MainActivity", "NativeBridge initialized on a background thread.")
         }
-        // AI-MOD-END
+        
 
         enableEdgeToEdge()
         setContent {

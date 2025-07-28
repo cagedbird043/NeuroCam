@@ -28,11 +28,11 @@ fun ImageProxy.toNv21ByteArray(): ByteArray {
     val uBuffer = uPlane.buffer
     val vBuffer = vPlane.buffer
 
-    // AI-MOD-START
+    
     // 核心修复：根据理论图像尺寸分配 ByteArray，而不是根据包含 padding 的 buffer.remaining()。
     // YUV420 格式的大小固定为 width * height * 1.5。
     val nv21 = ByteArray(width * height * 3 / 2)
-    // AI-MOD-END
+    
 
     // 3. 拷贝 Y 平面数据
     var yPos: Int

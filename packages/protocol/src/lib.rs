@@ -25,27 +25,25 @@ impl TryFrom<u8> for PacketType {
     }
 }
 
-// AI-MOD-START
 // --- 数据包 (Data) 相关 ---
 // 数据包头部的大小 (u32:4 + u64:8 + u16:2 + u16:2 + u8:1 = 17 bytes)
 pub const DATA_HEADER_SIZE: usize = 17;
-// AI-MOD-END
+
 pub const MAX_PAYLOAD_SIZE: usize = 1400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataHeader {
     pub frame_id: u32,
-    // AI-MOD-START
+
     /// 捕获时的原始时间戳（纳秒）
     pub capture_timestamp_ns: u64,
-    // AI-MOD-END
+
     pub packet_id: u16,
     pub total_packets: u16,
     pub is_key_frame: u8,
 }
 
 impl DataHeader {
-    // AI-MOD-START
     pub fn to_bytes(&self) -> [u8; DATA_HEADER_SIZE] {
         let mut bytes = [0u8; DATA_HEADER_SIZE];
         bytes[0..4].copy_from_slice(&self.frame_id.to_be_bytes());
@@ -73,7 +71,6 @@ impl DataHeader {
             is_key_frame,
         })
     }
-    // AI-MOD-END
 }
 
 // ... (AckPacket 和 tests 无变化)
