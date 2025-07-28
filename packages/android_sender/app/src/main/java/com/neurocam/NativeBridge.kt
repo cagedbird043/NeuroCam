@@ -2,6 +2,7 @@
 
 package com.neurocam
 
+import android.util.Log
 import kotlinx.coroutines.flow.asSharedFlow
 import java.nio.ByteBuffer
 
@@ -10,15 +11,15 @@ object NativeBridge {
     // --- Rust to Kotlin Communication via SharedFlow ---
     private val _keyFrameRequestFlow = kotlinx.coroutines.flow.MutableSharedFlow<Unit>()
     val keyFrameRequestFlow = _keyFrameRequestFlow.asSharedFlow()
-
+    var videoEncoder: VideoEncoder? = null
     /**
      * 这个函数由 Rust 层的 JNI 代码调用，作为一个回调。
      * 它向一个 SharedFlow 发射一个事件，通知应用层需要请求一个关键帧。
      */
-    @JvmStatic // 确保 Rust 可以像调用静态方法一样调用它
-    private fun requestKeyFrameFromNative() {
-        // tryEmit 是非阻塞的，适合从外部线程调用
-        _keyFrameRequestFlow.tryEmit(Unit)
+    @JvmStatic
+    fun requestKeyFrameFromNative() {
+        Log.i("NativeBridge", "JNI回调: requestKeyFrameFromNative 被调用")
+        onIFrameRequestFromRust()
     }
     // --- End of Communication Channel ---
 
@@ -37,6 +38,14 @@ object NativeBridge {
      * @param timestampNs 帧的捕获时间戳（纳秒）。
      */
     external fun sendVideoFrame(frameBuffer: java.nio.ByteBuffer, size: Int, isKeyFrame: Boolean, timestampNs: Long)
-    // AI-MOD-END
+
+    external fun sendSpsPps(buffer: ByteArray, size: Int)
+
+    fun onIFrameRequestFromRust() {
+        Log.i("NativeBridge", "收到I-Frame请求，videoEncoder=${videoEncoder != null}")
+        videoEncoder?.shouldSendSpsPps = true
+        videoEncoder?.requestKeyFrame()
+    }
+    
     external fun close()
 }

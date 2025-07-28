@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
 
     // 3. 进入主循环，只做一件事：接收UDP包
     let mut last_remote_ip: Option<std::net::IpAddr> = None;
-
+    let mut sps_pps_inject_count = 0usize;
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, remote_addr)) => {
@@ -169,6 +169,8 @@ async fn main() -> Result<()> {
                     &socket,
                     &mut latency_history,
                     pipeline_start_time,
+                    &mut sps_pps_inject_count,
+                    &pipeline,
                 )
                 .await;
             }
@@ -184,11 +186,37 @@ async fn handle_udp_packet(
     buf: &[u8],
     remote_addr: &SocketAddr,
     reassemblers: &mut HashMap<u32, FrameReassembler>,
-    appsrc: &gst_app::AppSrc, // 修改参数，直接接收 appsrc
+    appsrc: &gst_app::AppSrc,
     socket: &Arc<UdpSocket>,
     latency_history: &mut VecDeque<f64>,
-    pipeline_start_time: Instant, // 修改参数，接收固定的起始时间
+    pipeline_start_time: Instant,
+    sps_pps_inject_count: &mut usize,
+    pipeline: &gst::Pipeline, // 新增
 ) {
+    // --- 新增：SPS/PPS缓存 ---
+    use std::sync::OnceLock;
+    static SPS_PPS_CACHE: OnceLock<std::sync::Mutex<Option<Vec<u8>>>> = OnceLock::new();
+    let sps_pps_cache = SPS_PPS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    // --- 新增结束 ---
+
+    if len > 0 && PacketType::try_from(buf[0]) == Ok(PacketType::SpsPps) {
+        *sps_pps_cache.lock().unwrap() = Some(buf[1..len].to_vec());
+        *sps_pps_inject_count = 0;
+        println!("[INFO] SPS/PPS received via handshake, cached!");
+        if let Err(e) = pipeline.set_state(gst::State::Null) {
+            eprintln!("[ERROR] Failed to set pipeline to Null: {:?}", e);
+        }
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            eprintln!("[ERROR] Failed to set pipeline to Playing: {:?}", e);
+        }
+        // 新增：每次收到SPS/PPS都请求I-Frame
+        let request = [PacketType::IFrameRequest as u8];
+        if let Err(e) = socket.send_to(&request, remote_addr).await {
+            eprintln!("[ERROR] Failed to send I-Frame request: {}", e);
+        }
+        return;
+    }
+
     if len > 0 && PacketType::try_from(buf[0]) == Ok(PacketType::Data) {
         if let Some(header) = DataHeader::from_bytes(&buf[1..len]) {
             let reassembler = reassemblers
@@ -197,12 +225,52 @@ async fn handle_udp_packet(
             let payload = buf[1 + DATA_HEADER_SIZE..len].to_vec();
 
             if let Some(complete_frame) = reassembler.add_packet(header.packet_id, payload) {
-                // 新增：丢弃空帧，防止 v4l2sink/ffplay 崩溃
+                // 丢弃空帧
                 if complete_frame.is_empty() {
                     eprintln!("[WARN] Dropped empty frame (size=0), skipping push to appsrc.");
                     reassemblers.remove(&header.frame_id);
                     return;
                 }
+                if !reassembler.is_key_frame {
+                    // println!(
+                    //     "[DEBUG] Non-key frame: len={}, head={:02x?}",
+                    //     complete_frame.len(),
+                    //     &complete_frame[..std::cmp::min(32, complete_frame.len())]
+                    // );
+                }
+                if !reassembler.is_key_frame
+                    && complete_frame.len() < 8192
+                    && (complete_frame.windows(5).any(|w| w == [0, 0, 0, 1, 0x67])
+                        || complete_frame.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]))
+                {
+                    *sps_pps_cache.lock().unwrap() = Some(complete_frame.clone());
+                    reassemblers.remove(&header.frame_id);
+                    println!(
+                        "[INFO] SPS/PPS cached. len={}, head={:02x?}",
+                        complete_frame.len(),
+                        &complete_frame[..std::cmp::min(16, complete_frame.len())]
+                    );
+                    return;
+                }
+
+                // I帧前拼接缓存的SPS/PPS
+                let final_frame = if reassembler.is_key_frame {
+                    if *sps_pps_inject_count < 3 {
+                        if let Some(ref sps_pps) = *sps_pps_cache.lock().unwrap() {
+                            let mut v = sps_pps.clone();
+                            v.extend_from_slice(&complete_frame);
+                            *sps_pps_inject_count += 1;
+                            v
+                        } else {
+                            complete_frame.clone()
+                        }
+                    } else {
+                        complete_frame.clone()
+                    }
+                } else {
+                    complete_frame.clone()
+                };
+                // --- 新增结束 ---
 
                 let arrival_time_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -220,22 +288,21 @@ async fn handle_udp_packet(
                 let avg_latency: f64 =
                     latency_history.iter().sum::<f64>() / latency_history.len() as f64;
 
-                println!(
-                    "[FRAME] #{:<5} | Size: {:>5} bytes | Latency (now): {:>6.2} ms | Latency (avg): {:>6.2} ms",
-                    header.frame_id,
-                    complete_frame.len(),
-                    log_latency_ms,
-                    avg_latency,
-                );
+                // println!(
+                //     "[FRAME] #{:<5} | Size: {:>5} bytes | Latency (now): {:>6.2} ms | Latency (avg): {:>6.2} ms",
+                //     header.frame_id,
+                //     final_frame.len(),
+                //     log_latency_ms,
+                //     avg_latency,
+                // );
 
-                let mut gst_buffer = gst::Buffer::with_size(complete_frame.len()).unwrap();
+                let mut gst_buffer = gst::Buffer::with_size(final_frame.len()).unwrap();
                 {
                     let mut_buffer = gst_buffer.get_mut().unwrap();
-                    // 核心时间戳逻辑：使用从管线启动到现在的持续时间作为 PTS
                     let running_time = Instant::now().duration_since(pipeline_start_time);
                     mut_buffer
                         .set_pts(gst::ClockTime::from_nseconds(running_time.as_nanos() as u64));
-                    mut_buffer.copy_from_slice(0, &complete_frame).unwrap();
+                    mut_buffer.copy_from_slice(0, &final_frame).unwrap();
                 }
 
                 if let Err(e) = appsrc.push_buffer(gst_buffer) {
@@ -268,4 +335,3 @@ async fn handle_udp_packet(
         }
     }
 }
-// --- 核心修改 END ---

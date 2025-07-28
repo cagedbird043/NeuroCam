@@ -9,6 +9,7 @@ pub enum PacketType {
     Data = 0,
     Ack = 1,
     IFrameRequest = 2,
+    SpsPps = 3, // 新增
 }
 // ... (TryFrom 实现无变化)
 impl TryFrom<u8> for PacketType {
@@ -18,6 +19,7 @@ impl TryFrom<u8> for PacketType {
             0 => Ok(PacketType::Data),
             1 => Ok(PacketType::Ack),
             2 => Ok(PacketType::IFrameRequest),
+            3 => Ok(PacketType::SpsPps), // 必须加上
             _ => Err(()),
         }
     }
